@@ -1,4 +1,4 @@
-# Mock data for SmartCook rule-based checks
+# src/mock_data.py
 
 test_entity = {
     "meal_type": "ужин",
