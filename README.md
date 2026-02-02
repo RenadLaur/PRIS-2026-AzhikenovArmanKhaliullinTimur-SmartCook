@@ -61,3 +61,18 @@
 - Выполняется ранжирование  
 - Пользователь получает карточки блюд  
 
+### Схема (Mermaid.js)
+
+```mermaid
+flowchart TD
+    User["Пользователь"] -->|Фото продуктов| UI["Streamlit UI"]
+    User -->|Список ингредиентов| UI
+    UI -->|Изображение| CV["Распознавание продуктов (OpenCV + PyTorch)"]
+    CV -->|Список продуктов| Ingredients["Список ингредиентов"]
+    UI -->|Ингредиенты| Ingredients
+    Ingredients --> Allergens["Фильтрация аллергенов"]
+    Allergens --> Recipes["Подбор рецептов (RecipeNLG)"]
+    Recipes --> Ranking["Ранжирование (Scikit-learn)"]
+    Ranking --> UI
+    UI -->|Карточки блюд| User
+```
