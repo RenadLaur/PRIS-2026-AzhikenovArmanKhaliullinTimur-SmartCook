@@ -1,0 +1,14 @@
+{
+  "scenario_name": "Легкий ужин",
+  "thresholds": {
+    "min_calories": 200,
+    "max_calories": 800
+  },
+  "lists": {
+    "whitelist": ["курица", "рыба", "овощи"],
+    "blacklist": ["арахис", "креветки"]
+  },
+  "critical_rules": {
+    "must_have_allergy_info": true
+  }
+}

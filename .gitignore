@@ -1,3 +1,7 @@
 data/
+!data/
+data/*
+!data/raw/
+!data/raw/rules.json
 venv/
 __pycache__/
