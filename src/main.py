@@ -1,117 +1,75 @@
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
-import networkx as nx
 import streamlit as st
 
 try:
-    from .knowledge_graph import (
-        create_graph,
-        exclude_recipes_by_allergen,
-        find_related_entities,
-        find_related_recipes_for_allergen,
-    )
+    from .knowledge_graph import load_graph
+    from .logic import process_text_message
 except ImportError:
-    from knowledge_graph import (
-        create_graph,
-        exclude_recipes_by_allergen,
-        find_related_entities,
-        find_related_recipes_for_allergen,
-    )
+    from knowledge_graph import load_graph
+    from logic import process_text_message
 
-st.title("SmartCook Knowledge Graph Explorer 🕸")
-st.write("Исследуйте связи между рецептами, ингредиентами и аллергенами.")
 
-G = create_graph()
+st.set_page_config(page_title="SmartCook Chat", page_icon="🤖")
+st.title("AI Assistant")
+st.write("Спросите термин из базы знаний (рецепт, ингредиент или аллерген).")
 
-node_types = sorted({G.nodes[node].get("type", "unknown") for node in G.nodes})
+
+@st.cache_resource
+def get_data_source():
+    return load_graph()
+
+
+data_source = get_data_source()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Привет! Я бот SmartCook.\n"
+                "Введите название рецепта, ингредиента или аллергена."
+            ),
+        }
+    ]
+
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
 
 with st.sidebar:
-    st.header("Фильтры")
-    selected_type = st.selectbox("Тип узла:", ["Все"] + node_types)
+    st.header("Управление")
+    if st.button("Очистить чат", use_container_width=True):
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Чат очищен.\n"
+                    "Введите название рецепта, ингредиента или аллергена."
+                ),
+            }
+        ]
+        st.session_state.query_history = []
+        st.rerun()
 
-if selected_type == "Все":
-    available_nodes = sorted(G.nodes())
-else:
-    available_nodes = sorted(
-        [node for node in G.nodes() if G.nodes[node].get("type") == selected_type]
-    )
-
-selected_node = st.selectbox("Выберите объект для поиска связей:", available_nodes)
-
-if st.button("Найти связи"):
-    results = find_related_entities(G, selected_node)
-
-    if results:
-        st.success(f"Объект '{selected_node}' связан с {len(results)} узлами:")
-        for neighbor, relation, neighbor_type in results:
-            st.write(f"- {neighbor} — {relation} (тип: {neighbor_type})")
+    st.header("История запросов")
+    if st.session_state.query_history:
+        for idx, query in enumerate(st.session_state.query_history, start=1):
+            st.write(f"{idx}. {query}")
     else:
-        st.warning("Связи не найдены.")
+        st.caption("Пока нет запросов")
 
-    if G.nodes[selected_node].get("type") == "allergen":
-        linked_recipes = find_related_recipes_for_allergen(G, selected_node)
-        if linked_recipes:
-            st.info(
-                "Рецепты, связанные с аллергеном через ингредиенты: "
-                + ", ".join(linked_recipes)
-            )
-        else:
-            st.info("Нет рецептов, связанных с этим аллергеном через ингредиенты.")
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-st.write("### Безопасный фильтр по аллергену")
-allergen_nodes = sorted(
-    [node for node in G.nodes() if G.nodes[node].get("type") == "allergen"]
-)
-selected_allergen = st.selectbox(
-    "Исключить все рецепты, связанные с аллергеном:",
-    allergen_nodes,
-)
+if user_input := st.chat_input("Введите ваш запрос..."):
+    clean_input = user_input.strip()
+    if clean_input:
+        st.session_state.query_history.append(clean_input)
 
-if st.button("Применить исключение"):
-    safe_recipes, excluded_recipes = exclude_recipes_by_allergen(G, selected_allergen)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-    if excluded_recipes:
-        st.warning("Исключены рецепты: " + ", ".join(excluded_recipes))
-    else:
-        st.info("Связанные рецепты для исключения не найдены.")
-
-    if safe_recipes:
-        st.success("Остались безопасные рецепты: " + ", ".join(safe_recipes))
-    else:
-        st.error("После фильтрации безопасных рецептов не осталось.")
-
-st.write("### Визуализация структуры")
-fig, ax = plt.subplots(figsize=(9, 7))
-
-pos = nx.spring_layout(G, seed=42)
-
-color_map = {
-    "recipe": "#FFD166",
-    "ingredient": "#118AB2",
-    "allergen": "#EF476F",
-    "unknown": "#CCCCCC",
-}
-node_colors = [color_map.get(G.nodes[node].get("type", "unknown")) for node in G.nodes()]
-
-nx.draw(
-    G,
-    pos,
-    with_labels=True,
-    node_color=node_colors,
-    edge_color="#999999",
-    node_size=2000,
-    font_size=9,
-    ax=ax,
-)
-
-edge_labels = nx.get_edge_attributes(G, "relation")
-nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, ax=ax)
-
-legend_handles = [
-    mpatches.Patch(color=color_map["recipe"], label="Рецепт"),
-    mpatches.Patch(color=color_map["ingredient"], label="Ингредиент"),
-    mpatches.Patch(color=color_map["allergen"], label="Аллерген"),
-]
-ax.legend(handles=legend_handles, loc="upper left")
-
-st.pyplot(fig)
+    bot_response = process_text_message(clean_input, data_source)
+    st.session_state.messages.append({"role": "assistant", "content": bot_response})
+    with st.chat_message("assistant"):
+        st.markdown(bot_response)
