@@ -4,9 +4,9 @@ import re
 from difflib import get_close_matches
 
 try:
-    from .nlp import analyze_cooking_request, analyze_text_message
+    from .nlp import analyze_cooking_request, analyze_text_message, get_known_datasets
 except ImportError:
-    from nlp import analyze_cooking_request, analyze_text_message
+    from nlp import analyze_cooking_request, analyze_text_message, get_known_datasets
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_PATH = os.path.join(BASE_DIR, "data", "raw", "rules.json")
@@ -88,6 +88,35 @@ def _extract_nlp_payload(raw_text):
 
 def _join_items(items):
     return ", ".join(sorted({str(item) for item in items}))
+
+
+def _dataset_catalog():
+    return get_known_datasets()
+
+
+def _dataset_names():
+    return sorted(dataset.get("name", "") for dataset in _dataset_catalog() if dataset.get("name"))
+
+
+def _dataset_by_name(dataset_name):
+    normalized = _normalize(dataset_name)
+    for dataset in _dataset_catalog():
+        if _normalize(dataset.get("name", "")) == normalized:
+            return dataset
+    return None
+
+
+def _describe_dataset(dataset_name):
+    dataset = _dataset_by_name(dataset_name)
+    if dataset is None:
+        return f"Датасет '{dataset_name}' не найден в каталоге."
+
+    return (
+        f"Датасет: {dataset['name']}\n"
+        f"Описание: {dataset.get('description', 'нет описания')}\n"
+        f"Источник: {dataset.get('url', 'не указан')}\n"
+        f"Локальный путь: {dataset.get('local_path', 'не задан')}"
+    )
 
 
 def _graph_lists(graph):
@@ -284,6 +313,8 @@ def _recommend_recipe_from_query(graph, raw_text, query):
         "ингредиент",
         "список",
         "покажи",
+        "датасет",
+        "dataset",
     ]
     if not any(marker in query for marker in soft_markers):
         return None
@@ -306,6 +337,12 @@ def _recommend_recipe_from_query(graph, raw_text, query):
     target_cal = constraints.get("target_calories")
     limit = max(1, min(20, int(filters.get("max_results", 8))))
     all_recipes, all_ingredients, all_allergens = _graph_lists(graph)
+    all_datasets = _dataset_names()
+
+    if mode == "list_datasets":
+        return f"Подключенные датасеты: {_join_items(all_datasets)}"
+    if mode == "dataset_detail" and entities.get("datasets"):
+        return _describe_dataset(entities["datasets"][0])
 
     if mode == "list_allergens":
         return f"Доступные аллергены: {_join_items(all_allergens)}"
@@ -513,9 +550,9 @@ def process_text_message(text, data_source):
 
     if _is_nlp_request(query):
         payload = _extract_nlp_payload(text)
-        if len(_split_tokens(payload)) < 3:
+        if not payload.strip():
             return (
-                "Для NLP-анализа пришлите более содержательный кулинарный запрос.\n"
+                "После `/nlp` передайте текст запроса.\n"
                 "Пример: `/nlp Подбери ужин без глютена до 500 ккал с курицей на 2 порции`"
             )
         try:
@@ -532,7 +569,8 @@ def process_text_message(text, data_source):
             "- искать рецепты, ингредиенты и аллергены;\n"
             "- подбирать безопасные рецепты (например: 'без глютена');\n"
             "- находить рецепты по ингредиенту ('рецепты с курицей');\n"
-            "- фильтровать по калорийности ('до 500 ккал')."
+            "- фильтровать по калорийности ('до 500 ккал');\n"
+            "- показывать подключенные датасеты ('покажи датасеты')."
         )
 
     if hasattr(data_source, "nodes") and hasattr(data_source, "neighbors"):
@@ -548,6 +586,8 @@ def process_text_message(text, data_source):
             return f"Доступные ингредиенты: {_join_items(ingredients)}"
         if query in {"покажи аллергены", "аллергены", "список аллергенов"}:
             return f"Доступные аллергены: {_join_items(allergens)}"
+        if query in {"покажи датасеты", "датасеты", "список датасетов"}:
+            return f"Подключенные датасеты: {_join_items(_dataset_names())}"
 
         if any(
             phrase in query

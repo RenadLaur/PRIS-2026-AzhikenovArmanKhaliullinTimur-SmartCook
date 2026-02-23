@@ -44,6 +44,35 @@ MEAL_ALIASES = {
     "перекус": "перекус",
 }
 
+DATASET_CATALOG = (
+    {
+        "name": "RecipeNLG Dataset",
+        "aliases": [
+            "recipenlg",
+            "recipe nlg",
+            "recipe nlg dataset",
+            "recipe dataset",
+            "датасет рецептов",
+        ],
+        "description": "Текстовый датасет рецептов для NLP-задач.",
+        "url": "https://www.kaggle.com/datasets/saldenisov/recipenlg",
+        "local_path": "data/external/recipenlg/",
+    },
+    {
+        "name": "Food-11 Image Classification Dataset",
+        "aliases": [
+            "food-11",
+            "food11",
+            "food 11",
+            "food-11 image classification dataset",
+            "датасет food-11",
+        ],
+        "description": "Датасет изображений еды для CV-классификации.",
+        "url": "https://www.kaggle.com/datasets/imbikramsaha/food11",
+        "local_path": "data/external/food11/",
+    },
+)
+
 
 def _normalize(text):
     return str(text).strip().lower().replace("ё", "е")
@@ -90,6 +119,53 @@ def _extract_matches(query, candidates, cutoff=0.83):
         if matched:
             close.append(normalized[matched[0]])
     return _dedupe_keep_order(close)
+
+
+def get_known_datasets():
+    return [dict(item) for item in DATASET_CATALOG]
+
+
+def _dataset_alias_index():
+    alias_index = {}
+    for dataset in DATASET_CATALOG:
+        canonical = dataset["name"]
+        alias_index[_normalize(canonical)] = canonical
+        for alias in dataset.get("aliases", []):
+            alias_index[_normalize(alias)] = canonical
+    return alias_index
+
+
+def _extract_dataset_entities(text):
+    alias_index = _dataset_alias_index()
+    if not alias_index:
+        return []
+
+    query = _normalize(text)
+    matches = []
+
+    for alias, canonical in alias_index.items():
+        if alias and alias in query:
+            matches.append(canonical)
+    if matches:
+        return _dedupe_keep_order(matches)
+
+    alias_keys = list(alias_index.keys())
+    for token in _tokenize(query):
+        if len(token) < 4:
+            continue
+        close = get_close_matches(token, alias_keys, n=1, cutoff=0.88)
+        if close:
+            matches.append(alias_index[close[0]])
+
+    return _dedupe_keep_order(matches)
+
+
+def _dataset_by_name(dataset_name):
+    normalized = _normalize(dataset_name)
+    for dataset in DATASET_CATALOG:
+        if _normalize(dataset.get("name", "")) == normalized:
+            return dataset
+    return None
 
 
 def _extract_calorie_constraints(text):
@@ -201,12 +277,21 @@ def _detect_query_mode(text, entities):
     query = _normalize(text)
 
     if any(word in query for word in ["покажи", "список", "какие", "перечисли"]):
+        if "датасет" in query or "dataset" in query:
+            return "list_datasets"
         if "аллерген" in query:
             return "list_allergens"
         if "ингредиент" in query:
             return "list_ingredients"
         if "рецепт" in query:
             return "list_recipes"
+
+    if entities.get("datasets") and any(
+        word in query for word in ["что такое", "инфо", "подроб", "ссылка", "где скачать", "о датасете"]
+    ):
+        return "dataset_detail"
+    if entities.get("datasets") and any(word in query for word in ["датасет", "dataset"]):
+        return "dataset_detail"
 
     if entities.get("recipes") and any(word in query for word in ["состав", "калор", "что в", "инфо", "подроб"]):
         return "recipe_detail"
@@ -368,7 +453,7 @@ def analyze_cooking_request(text, data_source=None):
             "engine": "none",
             "query_mode": "generic",
             "intent": "Пустой запрос",
-            "entities": {"ingredients": [], "allergens": [], "recipes": []},
+            "entities": {"ingredients": [], "allergens": [], "recipes": [], "datasets": []},
             "filters": {
                 "include_ingredients": [],
                 "exclude_ingredients": [],
@@ -405,6 +490,7 @@ def analyze_cooking_request(text, data_source=None):
     mentioned_entities = _extract_graph_entities(
         search_text, ingredients_catalog, allergens_catalog, recipes_catalog
     )
+    dataset_entities = _extract_dataset_entities(search_text)
     excluded_ingredients, excluded_allergens = _extract_negative_entities(
         text, ingredients_catalog, allergens_catalog
     )
@@ -420,6 +506,7 @@ def analyze_cooking_request(text, data_source=None):
         "ingredients": positive_ingredients,
         "allergens": positive_allergens,
         "recipes": mentioned_entities.get("recipes", []),
+        "datasets": dataset_entities,
     }
 
     query_mode = _detect_query_mode(text, entities)
@@ -478,6 +565,7 @@ def analyze_text_message(text, data_source=None):
         _line("Рецепты", entities.get("recipes", [])),
         _line("Ингредиенты", entities.get("ingredients", [])),
         _line("Аллергены", entities.get("allergens", [])),
+        _line("Датасеты", entities.get("datasets", [])),
         "",
         "Извлеченные фильтры:",
         _line("Исключить ингредиенты", filters.get("exclude_ingredients", [])),
@@ -499,5 +587,28 @@ def analyze_text_message(text, data_source=None):
         lines.append(f"Доп. spaCy сущности: {', '.join(result['named_entities'])}")
     if result["warnings"]:
         lines.extend(["", "Примечания:"] + [f"- {warning}" for warning in result["warnings"]])
+
+    if result.get("query_mode") == "list_datasets":
+        lines.extend(
+            [
+                "",
+                "Подключенные датасеты:",
+                *[f"- {dataset['name']} ({dataset['url']})" for dataset in DATASET_CATALOG],
+            ]
+        )
+
+    if result.get("query_mode") == "dataset_detail" and entities.get("datasets"):
+        dataset = _dataset_by_name(entities["datasets"][0])
+        if dataset is not None:
+            lines.extend(
+                [
+                    "",
+                    "Информация о датасете:",
+                    f"- Название: {dataset['name']}",
+                    f"- Описание: {dataset.get('description', 'нет описания')}",
+                    f"- Источник: {dataset.get('url', 'не указан')}",
+                    f"- Локальный путь: {dataset.get('local_path', 'не задан')}",
+                ]
+            )
 
     return "\n".join(lines)
