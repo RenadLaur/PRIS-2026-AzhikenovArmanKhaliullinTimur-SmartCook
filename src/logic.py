@@ -3,6 +3,11 @@ import os
 import re
 from difflib import get_close_matches
 
+try:
+    from .nlp import analyze_cooking_request, analyze_text_message
+except ImportError:
+    from nlp import analyze_cooking_request, analyze_text_message
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_PATH = os.path.join(BASE_DIR, "data", "raw", "rules.json")
 
@@ -59,6 +64,28 @@ def _split_tokens(text):
     return [token for token in re.split(r"[^a-zA-Zа-яА-Я0-9]+", _normalize(text)) if token]
 
 
+def _is_nlp_request(query):
+    query = str(query or "").strip()
+    return query.startswith("/nlp") or query.startswith("nlp:")
+
+
+def _extract_nlp_payload(raw_text):
+    text = str(raw_text or "").strip()
+    lowered = text.lower()
+
+    prefixes = [
+        "/nlp",
+        "nlp:",
+        "разбери запрос:",
+        "проанализируй запрос:",
+        "анализ запроса:",
+    ]
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            return text[len(prefix) :].strip(" :\n\t")
+    return text
+
+
 def _join_items(items):
     return ", ".join(sorted({str(item) for item in items}))
 
@@ -90,6 +117,256 @@ def _format_recipe_list(graph, recipes, limit=8):
     if len(recipes) > limit:
         rendered.append(f"... и еще {len(recipes) - limit}")
     return ", ".join(rendered)
+
+
+def _extract_calorie_constraints(query):
+    max_match = re.search(r"(до|меньше|не более)\s*(\d{2,4})", query)
+    min_match = re.search(r"(от|больше|не менее)\s*(\d{2,4})", query)
+
+    max_cal = int(max_match.group(2)) if max_match else None
+    min_cal = int(min_match.group(2)) if min_match else None
+
+    if max_cal is None and "низкокал" in query:
+        max_cal = 450
+    if min_cal is None and "высококал" in query:
+        min_cal = 600
+    return min_cal, max_cal
+
+
+def _extract_meal_type(query):
+    if "завтрак" in query:
+        return "завтрак"
+    if "обед" in query:
+        return "обед"
+    if "ужин" in query:
+        return "ужин"
+    return None
+
+
+def _recipe_matches_meal(recipe_name, meal_type):
+    name = _normalize(recipe_name)
+    if meal_type == "завтрак":
+        hints = ["омлет", "панкейк", "сырник", "шакшука", "йогурт", "каша"]
+    elif meal_type == "обед":
+        hints = ["суп", "плов", "лагман", "бешбармак", "манты", "рамен", "паста"]
+    elif meal_type == "ужин":
+        hints = ["лосось", "курица", "говядина", "креветки", "тофу"]
+    else:
+        return True
+    return any(hint in name for hint in hints)
+
+
+def _recipe_ingredients(graph, recipe_name):
+    return sorted(
+        node
+        for node in graph.neighbors(recipe_name)
+        if graph.nodes[node].get("type") == "ingredient"
+    )
+
+
+def _recipe_allergens(graph, recipe_name):
+    allergens = set()
+    for ingredient in _recipe_ingredients(graph, recipe_name):
+        for neighbor in graph.neighbors(ingredient):
+            if graph.nodes[neighbor].get("type") == "allergen":
+                allergens.add(neighbor)
+    return sorted(allergens)
+
+
+def _recipes_with_required_ingredients(graph, recipes, required_ingredients):
+    if not required_ingredients:
+        return recipes
+
+    required = {_normalize(item) for item in required_ingredients}
+    matched = []
+    for recipe in recipes:
+        recipe_ingredients = {_normalize(item) for item in _recipe_ingredients(graph, recipe)}
+        if required.issubset(recipe_ingredients):
+            matched.append(recipe)
+    return matched
+
+
+def _recipes_without_excluded_ingredients(graph, recipes, excluded_ingredients):
+    if not excluded_ingredients:
+        return recipes
+
+    excluded = {_normalize(item) for item in excluded_ingredients}
+    filtered = []
+    for recipe in recipes:
+        recipe_ingredients = {_normalize(item) for item in _recipe_ingredients(graph, recipe)}
+        if recipe_ingredients.intersection(excluded):
+            continue
+        filtered.append(recipe)
+    return filtered
+
+
+def _exclude_recipes_by_requested_allergens(graph, recipes, allergens):
+    if not allergens:
+        return recipes
+
+    risky = set()
+    for allergen in allergens:
+        risky_recipes, _ = _risky_and_safe_recipes(graph, allergen)
+        risky.update(risky_recipes)
+    return [recipe for recipe in recipes if recipe not in risky]
+
+
+def _build_recipe_answer(graph, recipe_name):
+    calories = _recipe_calories(graph, recipe_name)
+    ingredients = _recipe_ingredients(graph, recipe_name)
+    allergens = _recipe_allergens(graph, recipe_name)
+    return (
+        f"Рецепт: {recipe_name} ({calories} ккал). "
+        f"Ингредиенты: {', '.join(ingredients) if ingredients else 'нет данных'}. "
+        f"Аллергены: {', '.join(allergens) if allergens else 'не обнаружены'}."
+    )
+
+
+def _score_recipe(graph, recipe_name, include_ingredients, meal_type, target_calories):
+    score = 0.0
+    recipe_ingredients = {_normalize(item) for item in _recipe_ingredients(graph, recipe_name)}
+
+    for ingredient in include_ingredients:
+        if _normalize(ingredient) in recipe_ingredients:
+            score += 6.0
+
+    if meal_type and _recipe_matches_meal(recipe_name, meal_type):
+        score += 2.0
+
+    if target_calories is not None:
+        calories = _recipe_calories(graph, recipe_name)
+        score -= abs(calories - target_calories) / 120.0
+
+    return score
+
+
+def _rank_recipes(graph, candidates, include_ingredients, meal_type, target_calories):
+    return sorted(
+        candidates,
+        key=lambda recipe: (
+            _score_recipe(graph, recipe, include_ingredients, meal_type, target_calories),
+            -_recipe_calories(graph, recipe),
+        ),
+        reverse=True,
+    )
+
+
+def _pick_recipe(candidates, meal_type, include_ingredients, target_calories, graph):
+    if not candidates:
+        return None
+
+    ranked = _rank_recipes(graph, candidates, include_ingredients, meal_type, target_calories)
+
+    if meal_type == "завтрак":
+        priority = ["омлет", "шакшука", "сырник", "панкейк", "йогурт"]
+        for hint in priority:
+            for recipe in ranked:
+                if hint in _normalize(recipe):
+                    return recipe
+    return ranked[0]
+
+
+def _recommend_recipe_from_query(graph, raw_text, query):
+    soft_markers = [
+        "рецепт",
+        "напиши",
+        "приготов",
+        "что приготовить",
+        "посоветуй",
+        "подбери",
+        "ккал",
+        "калори",
+        "завтрак",
+        "обед",
+        "ужин",
+        "без ",
+        "аллерг",
+        "ингредиент",
+        "список",
+        "покажи",
+    ]
+    if not any(marker in query for marker in soft_markers):
+        return None
+
+    try:
+        parsed = analyze_cooking_request(raw_text, graph)
+    except RuntimeError as exc:
+        return f"Ошибка NLP: {exc}"
+
+    mode = parsed.get("query_mode", "generic")
+    entities = parsed.get("entities", {})
+    filters = parsed.get("filters", {})
+    constraints = parsed.get("constraints", {})
+    meal_type = parsed.get("meal_type")
+    include_ingredients = filters.get("include_ingredients", [])
+    exclude_ingredients = filters.get("exclude_ingredients", [])
+    exclude_allergens = filters.get("exclude_allergens", [])
+    min_cal = constraints.get("min_calories")
+    max_cal = constraints.get("max_calories")
+    target_cal = constraints.get("target_calories")
+    limit = max(1, min(20, int(filters.get("max_results", 8))))
+    all_recipes, all_ingredients, all_allergens = _graph_lists(graph)
+
+    if mode == "list_allergens":
+        return f"Доступные аллергены: {_join_items(all_allergens)}"
+    if mode == "list_ingredients":
+        return f"Доступные ингредиенты: {_join_items(all_ingredients)}"
+
+    if mode == "recipe_detail" and entities.get("recipes"):
+        return _describe_node(graph, entities["recipes"][0])
+    if mode == "ingredient_detail" and entities.get("ingredients"):
+        ingredient_name = entities["ingredients"][0]
+        ingredient_recipes = _recipes_with_ingredient(graph, ingredient_name)
+        if ingredient_recipes:
+            return (
+                f"Ингредиент '{ingredient_name}' встречается в: "
+                f"{_format_recipe_list(graph, ingredient_recipes, limit=limit)}"
+            )
+    if mode == "allergen_detail" and entities.get("allergens"):
+        return _describe_node(graph, entities["allergens"][0])
+
+    candidates = _filter_recipes_by_calories(graph, max_cal=max_cal, min_cal=min_cal)
+    if meal_type:
+        candidates = [recipe for recipe in candidates if _recipe_matches_meal(recipe, meal_type)]
+    candidates = _recipes_with_required_ingredients(graph, candidates, include_ingredients)
+    candidates = _recipes_without_excluded_ingredients(graph, candidates, exclude_ingredients)
+    candidates = _exclude_recipes_by_requested_allergens(graph, candidates, exclude_allergens)
+    candidates = _rank_recipes(graph, candidates, include_ingredients, meal_type, target_cal)
+
+    is_recipe_intent = (
+        mode == "recipe_recommendation"
+        or any(
+            marker in query
+            for marker in ["рецепт", "напиши", "приготов", "что приготовить", "посоветуй"]
+        )
+    )
+    wants_list = mode in {"list_recipes", "list_ingredients"} or "рецепты" in query
+
+    if not candidates:
+        parts = []
+        if meal_type:
+            parts.append(meal_type)
+        if include_ingredients:
+            parts.append(f"с ингредиентами: {', '.join(include_ingredients)}")
+        if exclude_ingredients:
+            parts.append(f"без ингредиентов: {', '.join(exclude_ingredients)}")
+        if exclude_allergens:
+            parts.append(f"без аллергенов: {', '.join(exclude_allergens)}")
+        if min_cal is not None:
+            parts.append(f"от {min_cal} ккал")
+        if max_cal is not None:
+            parts.append(f"до {max_cal} ккал")
+        suffix = "; ".join(parts) if parts else "по вашим условиям"
+        return f"Не нашел рецепт ({suffix}). Попробуйте смягчить ограничения."
+
+    if is_recipe_intent and not wants_list:
+        chosen = _pick_recipe(candidates, meal_type, include_ingredients, target_cal, graph)
+        return _build_recipe_answer(graph, chosen)
+
+    if mode == "list_recipes" and min_cal is None and max_cal is None and not include_ingredients:
+        return f"Доступные рецепты: {_join_items(all_recipes)}"
+
+    return f"Подобрал варианты: {_format_recipe_list(graph, candidates, limit=limit)}"
 
 
 def _find_graph_matches(graph, query):
@@ -234,6 +511,18 @@ def process_text_message(text, data_source):
     if not query:
         return "Я не знаю такого термина"
 
+    if _is_nlp_request(query):
+        payload = _extract_nlp_payload(text)
+        if len(_split_tokens(payload)) < 3:
+            return (
+                "Для NLP-анализа пришлите более содержательный кулинарный запрос.\n"
+                "Пример: `/nlp Подбери ужин без глютена до 500 ккал с курицей на 2 порции`"
+            )
+        try:
+            return analyze_text_message(payload, data_source)
+        except RuntimeError as exc:
+            return f"Ошибка NLP: {exc}"
+
     if any(word in query for word in ["привет", "здравствуй", "добрый день", "hello"]):
         return "Привет! Я готов помочь. Напиши название объекта."
 
@@ -249,11 +538,15 @@ def process_text_message(text, data_source):
     if hasattr(data_source, "nodes") and hasattr(data_source, "neighbors"):
         recipes, ingredients, allergens = _graph_lists(data_source)
 
-        if "покажи рецепты" in query or query in {"рецепты", "список рецептов"}:
+        recipe_answer = _recommend_recipe_from_query(data_source, text, query)
+        if recipe_answer:
+            return recipe_answer
+
+        if query in {"покажи рецепты", "рецепты", "список рецептов"}:
             return f"Доступные рецепты: {_join_items(recipes)}"
-        if "покажи ингредиенты" in query or query in {"ингредиенты", "список ингредиентов"}:
+        if query in {"покажи ингредиенты", "ингредиенты", "список ингредиентов"}:
             return f"Доступные ингредиенты: {_join_items(ingredients)}"
-        if "покажи аллергены" in query or query in {"аллергены", "список аллергенов"}:
+        if query in {"покажи аллергены", "аллергены", "список аллергенов"}:
             return f"Доступные аллергены: {_join_items(allergens)}"
 
         if any(
@@ -296,16 +589,7 @@ def process_text_message(text, data_source):
 
         calorie_keywords = ["ккал", "калори", "низкокал", "высококал"]
         if any(word in query for word in calorie_keywords):
-            max_match = re.search(r"(до|меньше|не более)\s*(\d{2,4})", query)
-            min_match = re.search(r"(от|больше|не менее)\s*(\d{2,4})", query)
-
-            max_cal = int(max_match.group(2)) if max_match else None
-            min_cal = int(min_match.group(2)) if min_match else None
-
-            if max_cal is None and "низкокал" in query:
-                max_cal = 450
-            if min_cal is None and "высококал" in query:
-                min_cal = 600
+            min_cal, max_cal = _extract_calorie_constraints(query)
 
             cal_filtered = _filter_recipes_by_calories(
                 data_source, max_cal=max_cal, min_cal=min_cal

@@ -4,3 +4,6 @@ notebook
 opencv-python-headless
 networkx
 matplotlib
+spacy
+pymorphy3
+pymorphy3-dicts-ru
