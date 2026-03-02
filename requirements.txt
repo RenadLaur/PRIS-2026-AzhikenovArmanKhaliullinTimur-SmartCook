@@ -1,9 +1,11 @@
+deep-translator==1.11.4
+easyocr==1.7.2
 matplotlib==3.10.8
 networkx==3.6.1
 notebook==7.5.3
 numpy==2.4.2
 opencv-python-headless==4.13.0.92
-pandas==3.0.1
+pandas==2.3.3
 pymorphy3==2.0.6
 pymorphy3-dicts-ru==2.4.417150.4580142
 spacy==3.8.11

@@ -381,6 +381,8 @@ def _extract_with_spacy(text):
             lemmas.append(lemma)
 
     for ent in doc.ents:
+        if ent.label_ in {"DATE", "TIME"}:
+            continue
         named_entities.append(f"{ent.text} ({ent.label_})")
 
     lemma_counter = Counter(lemmas)

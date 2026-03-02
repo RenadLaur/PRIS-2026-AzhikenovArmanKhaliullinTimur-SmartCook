@@ -1,13 +1,17 @@
+import hashlib
+
 import streamlit as st
 
 try:
     from .knowledge_graph import load_graph
     from .logic import process_text_message
     from .nlp import get_spacy_status
+    from .vision import analyze_food_photo, get_vision_status
 except ImportError:
     from knowledge_graph import load_graph
     from logic import process_text_message
     from nlp import get_spacy_status
+    from vision import analyze_food_photo, get_vision_status
 
 
 st.set_page_config(page_title="SmartCook Chat", page_icon="🤖")
@@ -32,6 +36,7 @@ except Exception as exc:  # pragma: no cover - UI safeguard
     data_source_error = str(exc)
 
 spacy_status = get_spacy_status()
+vision_status = get_vision_status()
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -74,12 +79,78 @@ with st.sidebar:
     st.caption(f"Python: {spacy_status['python_executable']}")
     st.caption("Рекомендуемый запуск: `.venv/bin/streamlit run src/main.py`")
 
+    st.header("CV/OCR Статус")
+    if vision_status["food11_ready"]:
+        st.success("Food-11 найден.")
+    else:
+        st.warning("Food-11 не найден. Будет использован fallback подбор рецепта.")
+    if vision_status["easyocr_installed"]:
+        st.success("EasyOCR установлен.")
+    else:
+        st.info("EasyOCR не установлен. OCR-анализ отключен.")
+    if vision_status.get("cnn_model_ready"):
+        st.success("CNN-модель Food-11 готова.")
+    else:
+        st.warning(
+            "CNN-модель Food-11 не найдена. Запустите: "
+            "`.venv/bin/python scripts/train_food11_cnn.py --epochs 3`"
+        )
+    if vision_status.get("recipenlg_ready"):
+        st.success("RecipeNLG подключен.")
+    else:
+        st.warning("RecipeNLG не найден. Рецепты будут браться из fallback-логики.")
+    st.caption(f"Food-11 path: {vision_status['food11_path'] or 'не задан'}")
+    st.caption(f"RecipeNLG path: {vision_status.get('recipenlg_path') or 'не задан'}")
+
 if data_source_error:
     st.error(f"Ошибка загрузки базы знаний: {data_source_error}")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
+
+st.divider()
+st.subheader("Фото блюда: распознавание и рецепт")
+uploaded_image = st.file_uploader(
+    "Загрузите фото блюда (jpg/png/webp)", type=["jpg", "jpeg", "png", "webp"]
+)
+if uploaded_image is not None:
+    image_bytes = uploaded_image.getvalue()
+    image_hash = hashlib.sha1(image_bytes).hexdigest()
+    st.image(image_bytes, caption="Загруженное изображение", width="stretch")
+
+    analyze_button = st.button("Определить блюдо и предложить рецепт", type="primary")
+    if analyze_button:
+        if data_source is None:
+            st.error("База знаний не загружена. Невозможно подобрать рецепт.")
+        else:
+            with st.spinner("Анализирую фото..."):
+                result = analyze_food_photo(image_bytes, data_source)
+            st.session_state[f"vision_result_{image_hash}"] = result
+
+    cached_result = st.session_state.get(f"vision_result_{image_hash}")
+    if cached_result:
+        if cached_result.get("error"):
+            st.error(cached_result["error"])
+        else:
+            label = cached_result.get("predicted_label") or "не определено"
+            confidence = cached_result.get("confidence", 0.0)
+            st.markdown(f"**Предсказанный класс:** `{label}` (confidence: `{confidence}`)")
+            if cached_result.get("top_candidates"):
+                top_text = ", ".join(
+                    f"{name}: {score}" for name, score in cached_result["top_candidates"]
+                )
+                st.caption(f"Top кандидаты: {top_text}")
+            if cached_result.get("ocr_warning"):
+                st.warning(cached_result["ocr_warning"])
+            if cached_result.get("classification_note"):
+                st.warning(cached_result["classification_note"])
+            if cached_result.get("ocr_text"):
+                st.caption(f"OCR текст: {cached_result['ocr_text']}")
+            if cached_result.get("ingredient_hints"):
+                hints = ", ".join(cached_result["ingredient_hints"])
+                st.caption(f"Найденные ингредиентные подсказки: {hints}")
+            st.markdown(cached_result.get("recipe_text", "Рецепт не найден."))
 
 if user_input := st.chat_input("Введите ваш запрос..."):
     clean_input = user_input.strip()
