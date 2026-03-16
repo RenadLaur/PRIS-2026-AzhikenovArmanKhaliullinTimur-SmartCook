@@ -5,13 +5,15 @@ import streamlit as st
 try:
     from .knowledge_graph import load_graph
     from .logic import process_text_message
-    from .nlp import get_spacy_status
-    from .vision import analyze_food_photo, get_vision_status
+    from .nlp import get_spacy_status, warmup_spacy_model
+    from .pipeline import run_image_pipeline
+    from .vision import get_vision_status
 except ImportError:
     from knowledge_graph import load_graph
     from logic import process_text_message
-    from nlp import get_spacy_status
-    from vision import analyze_food_photo, get_vision_status
+    from nlp import get_spacy_status, warmup_spacy_model
+    from pipeline import run_image_pipeline
+    from vision import get_vision_status
 
 
 st.set_page_config(page_title="SmartCook Chat", page_icon="🤖")
@@ -22,6 +24,11 @@ st.write("Спросите термин из базы знаний (рецепт
 @st.cache_resource
 def get_data_source():
     return load_graph()
+
+
+@st.cache_resource
+def get_nlp_runtime():
+    return warmup_spacy_model()
 
 
 def _compact(text):
@@ -36,6 +43,7 @@ except Exception as exc:  # pragma: no cover - UI safeguard
     data_source_error = str(exc)
 
 spacy_status = get_spacy_status()
+nlp_runtime = get_nlp_runtime()
 vision_status = get_vision_status()
 
 if "messages" not in st.session_state:
@@ -73,6 +81,8 @@ with st.sidebar:
         st.error("spaCy не найден в текущем окружении.")
     elif not spacy_status["model_found"]:
         st.warning("spaCy установлен, но модель (`ru_core_news_sm`) не найдена.")
+    elif not nlp_runtime.get("ok"):
+        st.warning("spaCy найден, но прогрев модели не удался.")
     else:
         st.success("spaCy и модель доступны.")
 
@@ -125,32 +135,33 @@ if uploaded_image is not None:
             st.error("База знаний не загружена. Невозможно подобрать рецепт.")
         else:
             with st.spinner("Анализирую фото..."):
-                result = analyze_food_photo(image_bytes, data_source)
-            st.session_state[f"vision_result_{image_hash}"] = result
+                pipeline_result = run_image_pipeline(image_bytes, data_source)
+            st.session_state[f"vision_result_{image_hash}"] = pipeline_result
 
     cached_result = st.session_state.get(f"vision_result_{image_hash}")
     if cached_result:
-        if cached_result.get("error"):
-            st.error(cached_result["error"])
+        vision_result = cached_result.get("vision_result", {})
+        if vision_result.get("error"):
+            st.error(vision_result["error"])
         else:
-            label = cached_result.get("predicted_label") or "не определено"
-            confidence = cached_result.get("confidence", 0.0)
+            label = vision_result.get("predicted_label") or "не определено"
+            confidence = vision_result.get("confidence", 0.0)
             st.markdown(f"**Предсказанный класс:** `{label}` (confidence: `{confidence}`)")
-            if cached_result.get("top_candidates"):
+            if vision_result.get("top_candidates"):
                 top_text = ", ".join(
-                    f"{name}: {score}" for name, score in cached_result["top_candidates"]
+                    f"{name}: {score}" for name, score in vision_result["top_candidates"]
                 )
                 st.caption(f"Top кандидаты: {top_text}")
-            if cached_result.get("ocr_warning"):
-                st.warning(cached_result["ocr_warning"])
-            if cached_result.get("classification_note"):
-                st.warning(cached_result["classification_note"])
-            if cached_result.get("ocr_text"):
-                st.caption(f"OCR текст: {cached_result['ocr_text']}")
-            if cached_result.get("ingredient_hints"):
-                hints = ", ".join(cached_result["ingredient_hints"])
+            if vision_result.get("ocr_warning"):
+                st.warning(vision_result["ocr_warning"])
+            if vision_result.get("classification_note"):
+                st.warning(vision_result["classification_note"])
+            if vision_result.get("ocr_text"):
+                st.caption(f"OCR текст: {vision_result['ocr_text']}")
+            if vision_result.get("ingredient_hints"):
+                hints = ", ".join(vision_result["ingredient_hints"])
                 st.caption(f"Найденные ингредиентные подсказки: {hints}")
-            st.markdown(cached_result.get("recipe_text", "Рецепт не найден."))
+            st.markdown(cached_result.get("response", "Рецепт не найден."))
 
 if user_input := st.chat_input("Введите ваш запрос..."):
     clean_input = user_input.strip()

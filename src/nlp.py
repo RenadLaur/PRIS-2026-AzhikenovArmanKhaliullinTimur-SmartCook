@@ -262,6 +262,8 @@ def _extract_result_limit(text):
 def _classify_cooking_intent(text):
     query = _normalize(text)
 
+    if any(token in query for token in ["похож", "аналог", "что похоже", "similar"]):
+        return "Поиск похожих рецептов"
     if any(token in query for token in ["без ", "аллерг", "не переношу", "исключи", "убери"]):
         return "Фильтрация по аллергенам"
     if any(token in query for token in ["ккал", "калори", "низкокал", "высококал"]):
@@ -275,6 +277,9 @@ def _classify_cooking_intent(text):
 
 def _detect_query_mode(text, entities):
     query = _normalize(text)
+
+    if any(word in query for word in ["похож", "похожие", "аналог", "что похоже", "similar"]):
+        return "similarity_search"
 
     if any(word in query for word in ["покажи", "список", "какие", "перечисли"]):
         if "датасет" in query or "dataset" in query:
@@ -342,6 +347,14 @@ def get_spacy_status():
         },
         "python_executable": sys.executable,
     }
+
+
+def warmup_spacy_model():
+    try:
+        _load_spacy()
+        return {"ok": True, "error": ""}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _graph_catalogs(data_source):
