@@ -5,17 +5,36 @@ try:
     from .logic import process_text_message
     from .nlp import get_spacy_status, warmup_spacy_model
     from .pipeline import run_image_pipeline
+    from .recommender import (
+        graph_lists,
+        infer_meal_tags,
+        recipe_allergens,
+        recipe_calories,
+        recipe_ingredients,
+    )
     from .vision import get_vision_status
 except ImportError:
     from knowledge_graph import load_graph
     from logic import process_text_message
     from nlp import get_spacy_status, warmup_spacy_model
     from pipeline import run_image_pipeline
+    from recommender import graph_lists, infer_meal_tags, recipe_allergens, recipe_calories, recipe_ingredients
     from vision import get_vision_status
 
 
 def compact_text(text):
     return " ".join(str(text or "").split())
+
+
+def get_sample_queries():
+    return [
+        "похожие на плов",
+        "подбери ужин с курицей",
+        "подбери завтрак с яйцом",
+        "рецепты без молока",
+        "что похоже на омлет",
+        "/nlp покажи датасеты",
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -113,3 +132,67 @@ def handle_image_message(image_bytes):
     result["ok"] = not bool(result.get("vision_result", {}).get("error"))
     return result
 
+
+def get_dashboard_data():
+    graph = get_data_source()
+    recipes, ingredients, allergens = graph_lists(graph)
+
+    recipe_rows = []
+    allergen_counter = {}
+    meal_counter = {}
+
+    for recipe_name in recipes:
+        calories = recipe_calories(graph, recipe_name)
+        recipe_ingredient_list = recipe_ingredients(graph, recipe_name)
+        recipe_allergen_list = recipe_allergens(graph, recipe_name)
+        meal_tags = infer_meal_tags(recipe_name, recipe_ingredient_list)
+
+        recipe_rows.append(
+            {
+                "recipe": recipe_name,
+                "calories": calories,
+                "ingredients_count": len(recipe_ingredient_list),
+                "allergens_count": len(recipe_allergen_list),
+                "meal_tags": ", ".join(meal_tags),
+                "ingredients": ", ".join(recipe_ingredient_list),
+                "allergens": ", ".join(recipe_allergen_list) if recipe_allergen_list else "нет",
+            }
+        )
+
+        for allergen in recipe_allergen_list:
+            allergen_counter[allergen] = allergen_counter.get(allergen, 0) + 1
+
+        for tag in meal_tags:
+            meal_counter[tag] = meal_counter.get(tag, 0) + 1
+
+    allergen_rows = [
+        {"allergen": allergen, "recipes_count": count}
+        for allergen, count in sorted(allergen_counter.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    meal_rows = [
+        {"meal_type": meal_type, "recipes_count": count}
+        for meal_type, count in sorted(meal_counter.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+    top_calories = sorted(recipe_rows, key=lambda item: item["calories"], reverse=True)[:10]
+
+    return {
+        "summary": {
+            "recipes_count": len(recipes),
+            "ingredients_count": len(ingredients),
+            "allergens_count": len(allergens),
+        },
+        "recipes": recipe_rows,
+        "top_calories": top_calories,
+        "allergen_stats": allergen_rows,
+        "meal_stats": meal_rows,
+    }
+
+
+def get_api_catalog():
+    return [
+        {"method": "GET", "path": "/health", "purpose": "Проверка доступности API"},
+        {"method": "GET", "path": "/status", "purpose": "Статус NLP/CV и графа"},
+        {"method": "POST", "path": "/chat", "purpose": "Обработка текстового запроса"},
+        {"method": "POST", "path": "/image/analyze", "purpose": "Анализ изображения блюда"},
+    ]
