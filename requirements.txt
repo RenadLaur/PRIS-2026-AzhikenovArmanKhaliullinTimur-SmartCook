@@ -1,12 +1,15 @@
 deep-translator==1.11.4
 easyocr==1.7.2
+fastapi==0.117.1
 matplotlib==3.10.8
 networkx==3.6.1
 notebook==7.5.3
 numpy==2.4.2
 opencv-python-headless==4.13.0.92
 pandas==2.3.3
+python-multipart==0.0.20
 pymorphy3==2.0.6
 pymorphy3-dicts-ru==2.4.417150.4580142
 spacy==3.8.11
 streamlit==1.54.0
+uvicorn==0.36.0

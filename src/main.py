@@ -3,17 +3,14 @@ import hashlib
 import streamlit as st
 
 try:
-    from .knowledge_graph import load_graph
-    from .logic import process_text_message
-    from .nlp import get_spacy_status, warmup_spacy_model
-    from .pipeline import run_image_pipeline
-    from .vision import get_vision_status
+    from .app_service import (
+        compact_text,
+        get_runtime_status,
+        handle_chat_message,
+        handle_image_message,
+    )
 except ImportError:
-    from knowledge_graph import load_graph
-    from logic import process_text_message
-    from nlp import get_spacy_status, warmup_spacy_model
-    from pipeline import run_image_pipeline
-    from vision import get_vision_status
+    from app_service import compact_text, get_runtime_status, handle_chat_message, handle_image_message
 
 
 st.set_page_config(page_title="SmartCook Chat", page_icon="🤖")
@@ -22,29 +19,15 @@ st.write("Спросите термин из базы знаний (рецепт
 
 
 @st.cache_resource
-def get_data_source():
-    return load_graph()
+def get_ui_status():
+    return get_runtime_status()
 
 
-@st.cache_resource
-def get_nlp_runtime():
-    return warmup_spacy_model()
-
-
-def _compact(text):
-    return " ".join(str(text).split())
-
-
-data_source = None
-data_source_error = None
-try:
-    data_source = get_data_source()
-except Exception as exc:  # pragma: no cover - UI safeguard
-    data_source_error = str(exc)
-
-spacy_status = get_spacy_status()
-nlp_runtime = get_nlp_runtime()
-vision_status = get_vision_status()
+status = get_ui_status()
+graph_status = status["graph"]
+spacy_status = status["nlp"]["status"]
+nlp_runtime = status["nlp"]["runtime"]
+vision_status = status["vision"]
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -112,8 +95,8 @@ with st.sidebar:
     st.caption(f"Food-11 path: {vision_status['food11_path'] or 'не задан'}")
     st.caption(f"RecipeNLG path: {vision_status.get('recipenlg_path') or 'не задан'}")
 
-if data_source_error:
-    st.error(f"Ошибка загрузки базы знаний: {data_source_error}")
+if not graph_status["ok"]:
+    st.error(f"Ошибка загрузки базы знаний: {graph_status['error']}")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -131,12 +114,9 @@ if uploaded_image is not None:
 
     analyze_button = st.button("Определить блюдо и предложить рецепт", type="primary")
     if analyze_button:
-        if data_source is None:
-            st.error("База знаний не загружена. Невозможно подобрать рецепт.")
-        else:
-            with st.spinner("Анализирую фото..."):
-                pipeline_result = run_image_pipeline(image_bytes, data_source)
-            st.session_state[f"vision_result_{image_hash}"] = pipeline_result
+        with st.spinner("Анализирую фото..."):
+            pipeline_result = handle_image_message(image_bytes)
+        st.session_state[f"vision_result_{image_hash}"] = pipeline_result
 
     cached_result = st.session_state.get(f"vision_result_{image_hash}")
     if cached_result:
@@ -168,19 +148,14 @@ if user_input := st.chat_input("Введите ваш запрос..."):
     if clean_input:
         st.session_state.query_history.append(clean_input)
 
-    st.session_state.messages.append({"role": "user", "content": _compact(user_input)})
+    st.session_state.messages.append({"role": "user", "content": compact_text(user_input)})
     with st.chat_message("user"):
-        st.write(_compact(user_input))
+        st.write(compact_text(user_input))
 
-    if data_source is None:
-        bot_response = "Ошибка: база знаний не загружена. Проверьте консоль сервера."
-    else:
-        try:
-            bot_response = process_text_message(clean_input, data_source)
-        except Exception as exc:  # pragma: no cover - UI safeguard
-            bot_response = f"Ошибка обработки запроса: {exc}"
+    result = handle_chat_message(clean_input)
+    bot_response = result["response"]
 
-    compact_response = _compact(bot_response)
+    compact_response = compact_text(bot_response)
     st.session_state.messages.append({"role": "assistant", "content": compact_response})
     with st.chat_message("assistant"):
         st.write(compact_response)

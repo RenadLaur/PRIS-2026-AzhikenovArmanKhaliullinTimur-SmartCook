@@ -71,6 +71,49 @@ streamlit run src/main.py
 
 Это убирает разрозненную логику из UI и делает обработку запросов единым пайплайном.
 
+## Week 11: API и Backend
+
+Для Week 11 проект переведен на более модульную backend-архитектуру:
+
+- `src/app_service.py` - сервисный слой, общий для UI и API;
+- `src/api.py` - REST API на `FastAPI`;
+- `src/api_schemas.py` - схемы запросов/ответов API;
+- `src/main.py` - только Streamlit UI, без прямого вызова бизнес-логики.
+
+Теперь структура разделена на:
+
+- `UI`: `src/main.py`
+- `Service/Backend`: `src/app_service.py`
+- `API contracts`: `src/api_schemas.py`
+- `Domain logic`: `src/logic.py`, `src/pipeline.py`, `src/recommender.py`, `src/nlp.py`, `src/vision.py`
+
+### Запуск Streamlit UI
+
+```bash
+streamlit run src/main.py
+```
+
+### Запуск REST API
+
+```bash
+.venv/bin/uvicorn src.api:app --reload
+```
+
+После запуска доступны endpoints:
+
+- `GET /health`
+- `GET /status`
+- `POST /chat`
+- `POST /image/analyze`
+
+Пример запроса к API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"похожие на плов"}'
+```
+
 ## Week 7: Computer Vision (OCR + классификация изображений)
 
 В проект добавлен обработчик изображений в `src/vision.py`:
@@ -94,7 +137,6 @@ streamlit run src/main.py
 ```
 
 После обучения создается чекпоинт:
-
 ```text
 artifacts/food11_resnet18.pt
 ```
