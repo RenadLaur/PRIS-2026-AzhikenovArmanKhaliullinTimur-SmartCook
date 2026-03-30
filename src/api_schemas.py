@@ -11,10 +11,12 @@ class ChatResponse(BaseModel):
     ok: bool
     query: str
     response: str
+    recipe_title: str = ""
+    query_bucket: str = ""
 
 
 class StatusResponse(BaseModel):
-    graph: dict[str, Any]
+    datasets: dict[str, Any]
     nlp: dict[str, Any]
     vision: dict[str, Any]
 

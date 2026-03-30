@@ -262,6 +262,8 @@ def _extract_result_limit(text):
 def _classify_cooking_intent(text):
     query = _normalize(text)
 
+    if "датасет" in query or "dataset" in query:
+        return "Работа с датасетами"
     if any(token in query for token in ["похож", "аналог", "что похоже", "similar"]):
         return "Поиск похожих рецептов"
     if any(token in query for token in ["без ", "аллерг", "не переношу", "исключи", "убери"]):

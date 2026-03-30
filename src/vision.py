@@ -1,80 +1,31 @@
 from functools import lru_cache
 from pathlib import Path
 import ast
+import csv
 import importlib.util
-import os
 import re
 
 import cv2
 import numpy as np
 
 try:
-    import pandas as pd
-except ImportError:  # pragma: no cover - optional runtime import
-    pd = None
-
-try:
     from .nlp import get_known_datasets
+    from .recommender import search_recipenlg_candidates
 except ImportError:
     from nlp import get_known_datasets
+    from recommender import search_recipenlg_candidates
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 FOOD11_MODEL_PATH = "artifacts/food11_resnet18.pt"
-RECIPE_NLG_MAX_SCAN_CHUNKS = 12
-RECIPE_NLG_CHUNK_SIZE = 50000
 TRANSLATE_CHUNK_LIMIT = 4500
-
-# Used for RecipeNLG search (dataset-driven recipe suggestion)
-FOOD11_TO_RECIPE_KEYWORDS = {
-    "apple pie": ["apple pie", "pie"],
-    "cheesecake": ["cheesecake", "cheese cake"],
-    "chicken curry": ["chicken curry", "curry chicken"],
-    "french fries": ["french fries", "fries", "fried potato"],
-    "fried rice": ["fried rice", "rice"],
+RECIPE_NLG_PREVIEW_ROWS = 60000
+FOOD11_LABEL_ALIASES = {
     "hamburger": ["hamburger", "burger"],
-    "hot dog": ["hot dog", "sausage"],
-    "ice cream": ["ice cream"],
+    "hot dog": ["hot dog", "hotdog"],
     "omelette": ["omelette", "omelet"],
-    "pizza": ["pizza"],
-    "sushi": ["sushi", "roll"],
-    "bread": ["bread"],
-    "dairy product": ["milk", "cheese", "yogurt"],
-    "dessert": ["dessert", "cake", "cookie"],
-    "egg": ["egg"],
-    "fried food": ["fried"],
-    "meat": ["meat", "beef", "chicken", "pork"],
-    "noodles-pasta": ["noodle", "pasta"],
-    "rice": ["rice"],
-    "seafood": ["seafood", "fish", "shrimp", "salmon"],
-    "soup": ["soup"],
-    "vegetable-fruit": ["salad", "vegetable", "fruit"],
-}
-
-# Fallback hints only (when RecipeNLG has no good matches)
-FOOD11_INGREDIENT_HINTS = {
-    "apple pie": ["мука", "сахар"],
-    "cheesecake": ["творог", "сахар", "молоко"],
-    "chicken curry": ["курица", "рис", "лук"],
-    "french fries": ["картофель"],
-    "fried rice": ["рис", "морковь", "лук"],
-    "hamburger": ["говядина", "хлеб"],
-    "hot dog": ["хлеб", "курица"],
-    "ice cream": ["молоко", "сахар"],
-    "omelette": ["яйцо", "молоко", "сыр"],
-    "pizza": ["мука", "сыр", "помидор"],
-    "sushi": ["рис", "лосось"],
-    "bread": ["хлеб", "мука"],
-    "dairy product": ["сыр", "молоко", "йогурт"],
-    "dessert": ["сахар", "творог", "мед"],
-    "egg": ["яйцо"],
-    "fried food": ["картофель", "курица"],
-    "meat": ["говядина", "баранина", "курица"],
-    "noodles-pasta": ["лапша", "паста"],
-    "rice": ["рис"],
-    "seafood": ["лосось", "креветки", "тунец"],
-    "soup": ["чечевица", "лук", "морковь"],
-    "vegetable-fruit": ["помидор", "огурец", "морковь", "зелень"],
+    "french fries": ["french fries", "fries"],
+    "ice cream": ["ice cream", "icecream"],
 }
 
 
@@ -149,6 +100,10 @@ def _is_image_file(filename):
 
 def _display_label(raw_label):
     return str(raw_label).strip().replace("_", " ")
+
+
+def _tokenize(text):
+    return [token for token in re.split(r"[^a-zA-Zа-яА-Я0-9]+", _normalize(text)) if token]
 
 
 def _collect_food11_class_images(train_dir, per_class_limit=40):
@@ -346,11 +301,14 @@ def _get_ru_translator():
     if importlib.util.find_spec("deep_translator") is None:
         return None
     try:
-        from deep_translator import GoogleTranslator  # pylint: disable=import-outside-toplevel
+        from deep_translator import GoogleTranslator, MyMemoryTranslator  # pylint: disable=import-outside-toplevel
 
-        return GoogleTranslator(source="en", target="ru")
+        return GoogleTranslator(source="en", target="ru", timeout=4)
     except Exception:  # pragma: no cover - runtime safeguard
-        return None
+        try:
+            return MyMemoryTranslator(source="en-GB", target="ru-RU", timeout=4)
+        except Exception:  # pragma: no cover - runtime safeguard
+            return None
 
 
 def _translate_to_ru(text):
@@ -397,79 +355,43 @@ def _translate_to_ru(text):
 
 def _recipe_keywords_for_label(label):
     normalized = _normalize(label)
-    return FOOD11_TO_RECIPE_KEYWORDS.get(normalized, [normalized])
+    aliases = FOOD11_LABEL_ALIASES.get(normalized, [])
+    keywords = [normalized] + aliases
+    if " " in normalized:
+        keywords.append(normalized.replace(" ", ""))
+    return [keyword for keyword in dict.fromkeys(keywords) if keyword]
 
 
-@lru_cache(maxsize=64)
-def _search_recipenlg_by_keyword(keyword):
-    if pd is None:
-        return []
+@lru_cache(maxsize=1)
+def _dataset_ingredient_catalog():
     dataset_path = _recipenlg_csv_path()
     if dataset_path is None:
         return []
 
-    keyword = str(keyword).strip()
-    if not keyword:
-        return []
-
-    results = []
-    pattern = re.escape(keyword)
-
+    counter = {}
     try:
-        reader = pd.read_csv(
-            dataset_path,
-            usecols=["title", "ingredients", "directions", "NER"],
-            chunksize=RECIPE_NLG_CHUNK_SIZE,
-            on_bad_lines="skip",
-        )
+        with open(dataset_path, "r", encoding="utf-8", errors="ignore") as file:
+            reader = csv.DictReader(file)
+            for row_idx, row in enumerate(reader):
+                for ingredient in _parse_list_like(row.get("ingredients", "")):
+                    token = _normalize(ingredient)
+                    if len(token) < 3 or token.isdigit():
+                        continue
+                    counter[token] = counter.get(token, 0) + 1
+                if row_idx + 1 >= RECIPE_NLG_PREVIEW_ROWS:
+                    break
     except Exception:
         return []
 
-    for idx, chunk in enumerate(reader):
-        if idx >= RECIPE_NLG_MAX_SCAN_CHUNKS:
-            break
-
-        title_series = chunk["title"].astype(str)
-        ingredients_series = chunk["ingredients"].astype(str)
-        ner_series = chunk["NER"].astype(str)
-
-        mask = (
-            title_series.str.contains(pattern, case=False, na=False)
-            | ingredients_series.str.contains(pattern, case=False, na=False)
-            | ner_series.str.contains(pattern, case=False, na=False)
-        )
-        subset = chunk[mask]
-        if subset.empty:
-            continue
-
-        for _, row in subset.head(25).iterrows():
-            results.append(
-                {
-                    "title": str(row.get("title", "")).strip(),
-                    "ingredients": _parse_list_like(row.get("ingredients", "")),
-                    "directions": _parse_list_like(row.get("directions", "")),
-                    "ner": _parse_list_like(row.get("NER", "")),
-                }
-            )
-        if len(results) >= 40:
-            break
-
-    unique = []
-    seen = set()
-    for item in results:
-        key = _normalize(item.get("title", ""))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique[:40]
+    ranked = sorted(counter.items(), key=lambda item: item[1], reverse=True)
+    return [name for name, _ in ranked[:2000]]
 
 
 def _pick_recipenlg_recipe(label, ocr_text=""):
     keywords = _recipe_keywords_for_label(label)
     candidates = []
     for keyword in keywords:
-        candidates.extend(_search_recipenlg_by_keyword(keyword))
+        candidates.extend(search_recipenlg_candidates(keyword, limit=16))
 
     if not candidates:
         return None
@@ -496,11 +418,8 @@ def _format_recipenlg_recipe(recipe):
     directions = recipe.get("directions", [])[:3]
     title_ru = _translate_to_ru(title)
 
-    ingredients_ru = [_translate_to_ru(item) for item in ingredients]
-    directions_ru = [_translate_to_ru(item) for item in directions]
-
-    ingredients_text = ", ".join(ingredients_ru) if ingredients_ru else "нет данных"
-    directions_text = " ".join(directions_ru) if directions_ru else "нет шагов"
+    ingredients_text = _translate_to_ru(", ".join(ingredients)) if ingredients else "нет данных"
+    directions_text = _translate_to_ru(" ".join(directions)) if directions else "нет шагов"
 
     text = (
         f"**Рецепт: {title_ru}**\n\n"
@@ -510,91 +429,16 @@ def _format_recipenlg_recipe(recipe):
     return title_ru, text
 
 
-def _graph_recipe_nodes(graph):
-    return sorted(node for node in graph.nodes if graph.nodes[node].get("type") == "recipe")
-
-
-def _graph_ingredient_nodes(graph):
-    return sorted(node for node in graph.nodes if graph.nodes[node].get("type") == "ingredient")
-
-
-def _recipe_ingredients(graph, recipe_name):
-    return sorted(
-        node for node in graph.neighbors(recipe_name) if graph.nodes[node].get("type") == "ingredient"
-    )
-
-
-def _recipe_allergens(graph, recipe_name):
-    allergens = set()
-    for ingredient in _recipe_ingredients(graph, recipe_name):
-        for neighbor in graph.neighbors(ingredient):
-            if graph.nodes[neighbor].get("type") == "allergen":
-                allergens.add(neighbor)
-    return sorted(allergens)
-
-
-def _recipe_calories(graph, recipe_name):
-    data = graph.nodes[recipe_name].get("data")
-    calories = getattr(data, "calories", 0) if data is not None else 0
-    return int(calories or 0)
-
-
-def _recipe_answer(graph, recipe_name):
-    ingredients = _recipe_ingredients(graph, recipe_name)
-    allergens = _recipe_allergens(graph, recipe_name)
-    calories = _recipe_calories(graph, recipe_name)
-    return (
-        f"Рецепт: {recipe_name} ({calories} ккал). "
-        f"Ингредиенты: {', '.join(ingredients) if ingredients else 'нет данных'}. "
-        f"Аллергены: {', '.join(allergens) if allergens else 'не обнаружены'}."
-    )
-
-
-def _hints_from_label(label):
-    return FOOD11_INGREDIENT_HINTS.get(_normalize(label), [])
-
-
-def _hints_from_ocr_text(graph, ocr_text):
+def _hints_from_ocr_text(ocr_text):
     if not ocr_text:
-        return [], None
+        return []
 
-    text = _normalize(ocr_text)
-    recipes = _graph_recipe_nodes(graph)
-    for recipe in recipes:
-        if _normalize(recipe) in text:
-            return [], recipe
-
-    ingredients = []
-    for ingredient in _graph_ingredient_nodes(graph):
-        if _normalize(ingredient) in text:
-            ingredients.append(ingredient)
-    return sorted(set(ingredients)), None
+    ocr_tokens = set(_tokenize(ocr_text))
+    matched = [ingredient for ingredient in _dataset_ingredient_catalog() if ingredient in ocr_tokens]
+    return sorted(matched)[:8]
 
 
-def _best_recipe_by_hints(graph, hints):
-    recipes = _graph_recipe_nodes(graph)
-    if not recipes:
-        return None
-    if not hints:
-        return min(recipes, key=lambda recipe: _recipe_calories(graph, recipe))
-
-    hint_set = {_normalize(item) for item in hints}
-    scored = []
-    for recipe in recipes:
-        ingredients = {_normalize(item) for item in _recipe_ingredients(graph, recipe)}
-        overlap = len(hint_set.intersection(ingredients))
-        if overlap == 0:
-            continue
-        calories = _recipe_calories(graph, recipe)
-        scored.append((overlap, -calories, recipe))
-
-    if scored:
-        scored.sort(reverse=True)
-        return scored[0][2]
-    return min(recipes, key=lambda recipe: _recipe_calories(graph, recipe))
-
-
-def analyze_food_photo(image_bytes, graph):
+def analyze_food_photo(image_bytes, _data_source=None):
     image = _decode_image(image_bytes)
     if image is None:
         return {"error": "Не удалось прочитать изображение. Загрузите корректный файл JPG/PNG."}
@@ -610,15 +454,12 @@ def analyze_food_photo(image_bytes, graph):
     recipenlg_recipe = _pick_recipenlg_recipe(predicted_label or "", ocr_result.get("text", ""))
     recipe_name, recipe_text = _format_recipenlg_recipe(recipenlg_recipe)
 
-    # Fallback to graph only when RecipeNLG did not return matches
-    ingredient_hints = _hints_from_label(predicted_label or "")
+    ingredient_hints = [_translate_to_ru(item) for item in _hints_from_ocr_text(ocr_result.get("text", ""))]
     if recipe_text is None:
-        ocr_hints, recipe_from_ocr = _hints_from_ocr_text(graph, ocr_result.get("text", ""))
-        all_hints = sorted(set(ingredient_hints + ocr_hints))
-        selected_recipe = recipe_from_ocr or _best_recipe_by_hints(graph, all_hints)
-        recipe_name = selected_recipe
-        recipe_text = _recipe_answer(graph, selected_recipe) if selected_recipe else "Рецепт не найден."
-        ingredient_hints = all_hints
+        recipe_name = None
+        recipe_text = (
+            "Рецепт в RecipeNLG не найден. Попробуйте другое изображение или уточните блюдо текстом."
+        )
 
     classification_note = None
     if prediction.get("status") != "cnn_ok":

@@ -1,16 +1,13 @@
 import json
 import os
 import re
-from difflib import get_close_matches
 
 try:
     from .nlp import analyze_text_message
     from .pipeline import run_text_pipeline
-    from .recommender import graph_lists, join_items, recipe_allergens, recipe_calories, recipe_ingredients
 except ImportError:
     from nlp import analyze_text_message
     from pipeline import run_text_pipeline
-    from recommender import graph_lists, join_items, recipe_allergens, recipe_calories, recipe_ingredients
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_PATH = os.path.join(BASE_DIR, "data", "raw", "rules.json")
@@ -47,14 +44,6 @@ def check_rules(data):
     return f"✅ Успех: Блюдо соответствует сценарию '{rules['scenario_name']}'"
 
 
-def _format_dict_value(value):
-    if isinstance(value, list):
-        return ", ".join(str(item) for item in value)
-    if isinstance(value, dict):
-        return ", ".join(f"{key}: {val}" for key, val in value.items())
-    return str(value)
-
-
 def _normalize(text):
     return str(text).strip().lower().replace("ё", "е")
 
@@ -66,6 +55,11 @@ def _split_tokens(text):
 def _is_nlp_request(query):
     query = str(query or "").strip()
     return query.startswith("/nlp") or query.startswith("nlp:")
+
+
+def _is_debug_request(query):
+    query = str(query or "").strip()
+    return query.startswith("/debug") or query.startswith("debug:") or query.startswith("/explain")
 
 
 def _extract_nlp_payload(raw_text):
@@ -85,123 +79,113 @@ def _extract_nlp_payload(raw_text):
     return text
 
 
-def _find_graph_matches(graph, query):
-    node_map = {_normalize(node): node for node in graph.nodes}
-    if query in node_map:
-        return [node_map[query]]
+def _extract_debug_payload(raw_text):
+    text = str(raw_text or "").strip()
+    lowered = text.lower()
 
-    partial_matches = [
-        node for node in graph.nodes if query in _normalize(node) or _normalize(node) in query
+    prefixes = [
+        "/debug",
+        "debug:",
+        "/explain",
+        "объясни выбор:",
     ]
-    if partial_matches:
-        return sorted(partial_matches)
-
-    close = get_close_matches(query, list(node_map.keys()), n=5, cutoff=0.65)
-    return [node_map[item] for item in close]
-
-
-def _describe_node(graph, node_name):
-    node_type = graph.nodes[node_name].get("type", "unknown")
-    neighbors = list(graph.neighbors(node_name))
-
-    if node_type == "recipe":
-        response = [
-            f"Рецепт: {node_name} ({recipe_calories(graph, node_name)} ккал)",
-            f"Ингредиенты: {join_items(recipe_ingredients(graph, node_name)) or 'нет данных'}",
-            f"Аллергены: {join_items(recipe_allergens(graph, node_name)) or 'не обнаружены'}",
-        ]
-        return "\n".join(response)
-
-    if node_type == "ingredient":
-        recipes = [node for node in neighbors if graph.nodes[node].get("type") == "recipe"]
-        allergens = [node for node in neighbors if graph.nodes[node].get("type") == "allergen"]
-        response = [
-            f"Ингредиент: {node_name}",
-            f"Используется в рецептах: {join_items(recipes) if recipes else 'нет данных'}",
-            f"Связанные аллергены: {join_items(allergens) if allergens else 'не обнаружены'}",
-        ]
-        return "\n".join(response)
-
-    if node_type == "allergen":
-        ingredients = [node for node in neighbors if graph.nodes[node].get("type") == "ingredient"]
-        response = [
-            f"Аллерген: {node_name}",
-            f"Источники (ингредиенты): {join_items(ingredients) if ingredients else 'нет данных'}",
-        ]
-        return "\n".join(response)
-
-    return f"Я нашел '{node_name}' в базе. Соседи: {join_items(neighbors)}"
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            return text[len(prefix) :].strip(" :\n\t")
+    return text
 
 
-def process_text_message(text, data_source):
+def _pipeline_recipe_title(pipeline_result):
+    decision = (pipeline_result or {}).get("stages", {}).get("decision", {})
+    ranked = decision.get("ranked") or []
+    if ranked and isinstance(ranked[0], dict):
+        return str(ranked[0].get("title", "")).strip()
+    return ""
+
+
+def process_text_interaction(text, data_source, context=None):
     if text is None:
-        return "Я не знаю такого термина"
+        return {"response": "Я не знаю такого термина", "recipe_title": ""}
 
     query = _normalize(text)
     if not query:
-        return "Я не знаю такого термина"
+        return {"response": "Я не знаю такого термина", "recipe_title": ""}
 
     if _is_nlp_request(query):
         payload = _extract_nlp_payload(text)
         if not payload.strip():
-            return (
-                "После `/nlp` передайте текст запроса.\n"
-                "Пример: `/nlp Подбери ужин без глютена до 500 ккал с курицей на 2 порции`"
-            )
+            return {
+                "response": (
+                    "После `/nlp` передайте текст запроса.\n"
+                    "Пример: `/nlp Подбери ужин без глютена до 500 ккал с курицей на 2 порции`"
+                ),
+                "recipe_title": "",
+            }
         try:
-            return analyze_text_message(payload, data_source)
+            return {"response": analyze_text_message(payload, data_source), "recipe_title": ""}
         except RuntimeError as exc:
-            return f"Ошибка NLP: {exc}"
+            return {"response": f"Ошибка NLP: {exc}", "recipe_title": ""}
+
+    if _is_debug_request(query):
+        payload = _extract_debug_payload(text)
+        if not payload.strip():
+            return {
+                "response": (
+                    "После `/debug` передайте запрос.\n"
+                    "Пример: `/debug рецепт борща`"
+                ),
+                "recipe_title": "",
+            }
+        pipeline_result = run_text_pipeline(
+            payload,
+            data_source,
+            debug=True,
+            exclude_titles=(context or {}).get("exclude_titles", []),
+        )
+        if pipeline_result.get("handled"):
+            return {
+                "response": pipeline_result.get("response") or "Не удалось объяснить выбор.",
+                "recipe_title": _pipeline_recipe_title(pipeline_result),
+            }
+        return {"response": "Не удалось собрать debug-пояснение для этого запроса.", "recipe_title": ""}
 
     if any(word in query for word in ["привет", "здравствуй", "добрый день", "hello"]):
-        return "Привет! Я готов помочь. Напиши название объекта."
+        return {"response": "Привет! Напиши запрос о блюде, рецепте или загрузи фото блюда.", "recipe_title": ""}
 
     if query in {"помощь", "help", "что ты умеешь", "команды"}:
-        return (
-            "Я умею:\n"
-            "- искать рецепты, ингредиенты и аллергены;\n"
-            "- подбирать рецепты по правилам и ограничениям;\n"
-            "- искать похожие блюда по cosine/fuzzy similarity;\n"
-            "- обрабатывать запросы через NLP (`/nlp ...`);\n"
-            "- анализировать фото блюда через CV/OCR."
-        )
+        return {
+            "response": (
+                "Я умею:\n"
+                "- искать рецепты в RecipeNLG на русском;\n"
+                "- подбирать похожие блюда по описанию и ингредиентам;\n"
+                "- обрабатывать запросы через NLP (`/nlp ...`);\n"
+                "- показывать техническое объяснение через `/debug ...`;\n"
+                "- анализировать фото блюда через Food-11 + RecipeNLG."
+            ),
+            "recipe_title": "",
+        }
 
-    if hasattr(data_source, "nodes") and hasattr(data_source, "neighbors"):
-        pipeline_result = run_text_pipeline(text, data_source)
-        if pipeline_result.get("handled"):
-            return pipeline_result.get("response") or "Не удалось обработать запрос."
-
-        recipes, ingredients, allergens = graph_lists(data_source)
-        if query in {"покажи рецепты", "рецепты", "список рецептов"}:
-            return f"Доступные рецепты: {join_items(recipes)}"
-        if query in {"покажи ингредиенты", "ингредиенты", "список ингредиентов"}:
-            return f"Доступные ингредиенты: {join_items(ingredients)}"
-        if query in {"покажи аллергены", "аллергены", "список аллергенов"}:
-            return f"Доступные аллергены: {join_items(allergens)}"
-
-        matches = _find_graph_matches(data_source, query)
-        if len(matches) == 1:
-            return _describe_node(data_source, matches[0])
-        if len(matches) > 1:
-            preview = ", ".join(matches[:6])
-            suffix = "" if len(matches) <= 6 else f" и еще {len(matches) - 6}"
-            return f"Нашел несколько похожих терминов: {preview}{suffix}. Уточните запрос."
-
-    if isinstance(data_source, dict):
-        for key, value in data_source.items():
-            if _normalize(key) == query:
-                return f"Найдено по ключу '{key}': {_format_dict_value(value)}"
-
-            if isinstance(value, str) and query in _normalize(value):
-                return f"Найдено в '{key}': {value}"
-
-            if isinstance(value, list):
-                list_values = [str(item) for item in value]
-                if query in [_normalize(item) for item in list_values]:
-                    return f"Найдено в '{key}': {', '.join(list_values)}"
-
-    return (
-        "Я не знаю такого термина.\n"
-        "Попробуйте: 'похожие блюда на плов', 'рецепты с курицей', 'без глютена', "
-        "'до 500 ккал' или точное название блюда."
+    pipeline_result = run_text_pipeline(
+        text,
+        data_source,
+        debug=False,
+        exclude_titles=(context or {}).get("exclude_titles", []),
     )
+    if pipeline_result.get("handled"):
+        return {
+            "response": pipeline_result.get("response") or "Не удалось обработать запрос.",
+            "recipe_title": _pipeline_recipe_title(pipeline_result),
+        }
+
+    return {
+        "response": (
+            "Не удалось подобрать рецепт из подключенных датасетов.\n"
+            "Попробуйте: 'похожие на плов', 'рецепт с курицей и рисом', "
+            "'подбери ужин с курицей' или загрузите фото блюда."
+        ),
+        "recipe_title": "",
+    }
+
+
+def process_text_message(text, data_source, context=None):
+    return process_text_interaction(text, data_source, context=context)["response"]

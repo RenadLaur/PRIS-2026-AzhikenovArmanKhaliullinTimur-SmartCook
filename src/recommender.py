@@ -1,20 +1,19 @@
 from collections import Counter
-from difflib import SequenceMatcher, get_close_matches
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 import ast
+import csv
 import math
 import re
+import sqlite3
+import time
 
 try:
-    import pandas as pd
-except ImportError:  # pragma: no cover - optional runtime import
-    pd = None
-
-try:
-    from deep_translator import GoogleTranslator
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
 except ImportError:  # pragma: no cover - optional runtime import
     GoogleTranslator = None
+    MyMemoryTranslator = None
 
 try:
     from .nlp import get_known_datasets
@@ -31,6 +30,9 @@ MEAL_HINTS = {
 RECIPE_NLG_MAX_SCAN_CHUNKS = 8
 RECIPE_NLG_CHUNK_SIZE = 50000
 RECIPE_NLG_MAX_CANDIDATES = 120
+RECIPE_NLG_SEARCH_POOL = 320
+RECIPE_NLG_INDEX_BATCH_SIZE = 5000
+RECIPE_NLG_INDEX_SCHEMA_VERSION = "2"
 TRANSLATE_CHUNK_LIMIT = 4500
 STOP_TOKENS = {
     "что",
@@ -47,13 +49,89 @@ STOP_TOKENS = {
     "мне",
     "для",
     "это",
+    "recipe",
+    "recipes",
+    "dish",
+    "food",
+    "please",
+    "with",
+    "another",
+    "other",
+    "different",
+    "choose",
+    "pick",
+    "find",
+    "show",
+    "give",
+}
+MEAL_QUERY_TOKENS = {"breakfast", "lunch", "dinner", "snack"}
+MEAL_TAGS = {
+    "завтрак": "mealbreakfast",
+    "обед": "meallunch",
+    "ужин": "mealdinner",
+    "перекус": "mealsnack",
+}
+GENERIC_CATEGORY_HINTS = {
+    "salad": {
+        "native_tokens": {"салат", "салаты"},
+        "dataset_tokens": ["salad"],
+        "required_tokens": {"salad"},
+        "exclude_title_tokens": {"dressing", "dip", "sauce"},
+    },
+    "soup": {
+        "native_tokens": {"суп", "супы"},
+        "dataset_tokens": ["soup", "broth", "chowder", "bisque"],
+        "required_tokens": {"soup", "broth", "chowder", "bisque", "borscht"},
+        "exclude_title_tokens": set(),
+    },
+    "pizza": {
+        "native_tokens": {"пицца", "пиццы"},
+        "dataset_tokens": ["pizza"],
+        "required_tokens": {"pizza"},
+        "exclude_title_tokens": set(),
+    },
+    "burger": {
+        "native_tokens": {"бургер", "бургеры", "гамбургер"},
+        "dataset_tokens": ["burger", "hamburger"],
+        "required_tokens": {"burger", "hamburger"},
+        "exclude_title_tokens": set(),
+    },
+    "sushi": {
+        "native_tokens": {"суши"},
+        "dataset_tokens": ["sushi"],
+        "required_tokens": {"sushi"},
+        "exclude_title_tokens": set(),
+    },
+    "pasta": {
+        "native_tokens": {"паста", "макароны"},
+        "dataset_tokens": ["pasta", "spaghetti", "macaroni"],
+        "required_tokens": {"pasta", "spaghetti", "macaroni"},
+        "exclude_title_tokens": set(),
+    },
+    "omelette": {
+        "native_tokens": {"омлет"},
+        "dataset_tokens": ["omelette", "omelet"],
+        "required_tokens": {"omelette", "omelet"},
+        "exclude_title_tokens": set(),
+    },
+    "dessert": {
+        "native_tokens": {"десерт", "десерты", "сладкое"},
+        "dataset_tokens": ["dessert", "cake", "cookie", "brownie", "pie", "pudding"],
+        "required_tokens": {"dessert", "cake", "cookie", "brownie", "pie", "pudding"},
+        "exclude_title_tokens": set(),
+    },
 }
 DATASET_TOKEN_ALIASES = {
     "кур": ["chicken"],
+    "куриц": ["chicken"],
     "рис": ["rice"],
+    "плов": ["pilaf", "rice"],
+    "борщ": ["borscht", "borsch", "borshch"],
+    "свекл": ["beet", "beetroot", "borscht"],
     "яй": ["egg", "omelette"],
     "сыр": ["cheese"],
     "мол": ["milk"],
+    "сал": ["salad"],
     "говяд": ["beef"],
     "баран": ["lamb"],
     "рыб": ["fish"],
@@ -72,6 +150,25 @@ DATASET_TOKEN_ALIASES = {
     "завтр": ["breakfast", "egg", "omelette", "pancake"],
     "десерт": ["dessert", "cake", "cookie"],
 }
+TRANSLATION_FILLER_PATTERNS = [
+    r"\bчто\s+похоже\s+на\b",
+    r"\bпохожие?\s+на\b",
+    r"\bаналог\b",
+    r"\bрецепт\b",
+    r"\bрецепты\b",
+    r"\bподбери\b",
+    r"\bпосоветуй\b",
+    r"\bчто\s+приготовить\b",
+    r"\bприготовить\b",
+]
+BASE_DIR = Path(__file__).resolve().parent.parent
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+RECIPE_NLG_INDEX_PATH = ARTIFACTS_DIR / "recipenlg_search.sqlite3"
+_TRANSLATION_RUNTIME = {
+    "ru": {"provider": None, "last_error": None},
+    "en": {"provider": None, "last_error": None},
+}
+_SEARCH_INDEX_RUNTIME = {"backend": "sqlite_fts5", "last_error": None}
 
 
 def normalize(text):
@@ -84,73 +181,6 @@ def tokenize(text):
 
 def join_items(items):
     return ", ".join(sorted({str(item) for item in items}))
-
-
-def graph_lists(graph):
-    recipes = sorted(node for node in graph.nodes if graph.nodes[node].get("type") == "recipe")
-    ingredients = sorted(
-        node for node in graph.nodes if graph.nodes[node].get("type") == "ingredient"
-    )
-    allergens = sorted(node for node in graph.nodes if graph.nodes[node].get("type") == "allergen")
-    return recipes, ingredients, allergens
-
-
-def recipe_calories(graph, recipe_name):
-    data = graph.nodes[recipe_name].get("data")
-    calories = getattr(data, "calories", 0) if data is not None else 0
-    return int(calories or 0)
-
-
-def recipe_ingredients(graph, recipe_name):
-    return sorted(
-        node for node in graph.neighbors(recipe_name) if graph.nodes[node].get("type") == "ingredient"
-    )
-
-
-def recipe_allergens(graph, recipe_name):
-    allergens = set()
-    for ingredient in recipe_ingredients(graph, recipe_name):
-        for neighbor in graph.neighbors(ingredient):
-            if graph.nodes[neighbor].get("type") == "allergen":
-                allergens.add(neighbor)
-    return sorted(allergens)
-
-
-def format_recipe_answer(graph, recipe_name):
-    calories = recipe_calories(graph, recipe_name)
-    ingredients = recipe_ingredients(graph, recipe_name)
-    allergens = recipe_allergens(graph, recipe_name)
-    return (
-        f"Рецепт: {recipe_name} ({calories} ккал). "
-        f"Ингредиенты: {', '.join(ingredients) if ingredients else 'нет данных'}. "
-        f"Аллергены: {', '.join(allergens) if allergens else 'не обнаружены'}."
-    )
-
-
-def infer_meal_tags(recipe_name, ingredients=None):
-    text = normalize(recipe_name)
-    if ingredients:
-        text = f"{text} {' '.join(normalize(item) for item in ingredients)}"
-
-    tags = []
-    for meal_type, hints in MEAL_HINTS.items():
-        if any(hint in text for hint in hints):
-            tags.append(meal_type)
-    return tags or ["универсально"]
-
-
-def recipe_document(graph, recipe_name):
-    ingredients = recipe_ingredients(graph, recipe_name)
-    allergens = recipe_allergens(graph, recipe_name)
-    meal_tags = infer_meal_tags(recipe_name, ingredients)
-    parts = [
-        recipe_name,
-        " ".join(ingredients),
-        " ".join(allergens),
-        " ".join(meal_tags),
-        f"{recipe_calories(graph, recipe_name)} ккал",
-    ]
-    return " ".join(part for part in parts if part.strip())
 
 
 def _dataset_by_name(name):
@@ -175,7 +205,7 @@ def recipenlg_csv_path():
 
 
 def recipenlg_ready():
-    return recipenlg_csv_path() is not None and pd is not None
+    return recipenlg_csv_path() is not None
 
 
 def _parse_list_like(value):
@@ -202,22 +232,48 @@ def _parse_list_like(value):
 
 @lru_cache(maxsize=1)
 def _get_ru_translator():
-    if GoogleTranslator is None:
-        return None
-    try:
-        return GoogleTranslator(source="auto", target="ru")
-    except Exception:  # pragma: no cover - network/runtime safeguard
-        return None
+    if GoogleTranslator is not None:
+        try:
+            translator = GoogleTranslator(source="en", target="ru", timeout=4)
+            _TRANSLATION_RUNTIME["ru"]["provider"] = "GoogleTranslator"
+            _TRANSLATION_RUNTIME["ru"]["last_error"] = None
+            return translator
+        except Exception:  # pragma: no cover - network/runtime safeguard
+            _TRANSLATION_RUNTIME["ru"]["last_error"] = "GoogleTranslator init failed"
+    if MyMemoryTranslator is not None:
+        try:
+            translator = MyMemoryTranslator(source="en-GB", target="ru-RU", timeout=4)
+            _TRANSLATION_RUNTIME["ru"]["provider"] = "MyMemoryTranslator"
+            _TRANSLATION_RUNTIME["ru"]["last_error"] = None
+            return translator
+        except Exception:  # pragma: no cover - network/runtime safeguard
+            _TRANSLATION_RUNTIME["ru"]["last_error"] = "MyMemoryTranslator init failed"
+    return None
 
 
 @lru_cache(maxsize=1)
 def _get_en_translator():
-    if GoogleTranslator is None:
-        return None
-    try:
-        return GoogleTranslator(source="auto", target="en")
-    except Exception:  # pragma: no cover - network/runtime safeguard
-        return None
+    if GoogleTranslator is not None:
+        try:
+            translator = GoogleTranslator(source="ru", target="en", timeout=4)
+            _TRANSLATION_RUNTIME["en"]["provider"] = "GoogleTranslator"
+            _TRANSLATION_RUNTIME["en"]["last_error"] = None
+            return translator
+        except Exception:  # pragma: no cover - network/runtime safeguard
+            _TRANSLATION_RUNTIME["en"]["last_error"] = "GoogleTranslator init failed"
+    if MyMemoryTranslator is not None:
+        try:
+            translator = MyMemoryTranslator(source="ru-RU", target="en-GB", timeout=4)
+            _TRANSLATION_RUNTIME["en"]["provider"] = "MyMemoryTranslator"
+            _TRANSLATION_RUNTIME["en"]["last_error"] = None
+            return translator
+        except Exception:  # pragma: no cover - network/runtime safeguard
+            _TRANSLATION_RUNTIME["en"]["last_error"] = "MyMemoryTranslator init failed"
+    return None
+
+
+def _contains_cyrillic(text):
+    return bool(re.search(r"[а-яА-Я]", str(text or "")))
 
 
 @lru_cache(maxsize=512)
@@ -225,6 +281,8 @@ def translate_to_ru(text):
     text = str(text or "").strip()
     if not text:
         return ""
+    if _contains_cyrillic(text):
+        return text
 
     translator = _get_ru_translator()
     if translator is None:
@@ -234,6 +292,7 @@ def translate_to_ru(text):
         try:
             return translator.translate(text)
         except Exception:  # pragma: no cover - network/runtime safeguard
+            _TRANSLATION_RUNTIME["ru"]["last_error"] = "translation request failed"
             return text
 
     return text
@@ -244,6 +303,8 @@ def translate_to_en(text):
     text = str(text or "").strip()
     if not text:
         return ""
+    if not _contains_cyrillic(text):
+        return text
 
     translator = _get_en_translator()
     if translator is None:
@@ -252,29 +313,363 @@ def translate_to_en(text):
     try:
         return translator.translate(text)
     except Exception:  # pragma: no cover - network/runtime safeguard
+        _TRANSLATION_RUNTIME["en"]["last_error"] = "translation request failed"
         return text
 
 
-def _dataset_query_tokens(query_text, include_ingredients=None):
-    include_ingredients = include_ingredients or []
-    translated_query = translate_to_en(query_text)
-    translated_ingredients = [translate_to_en(entry) for entry in include_ingredients]
-    tokens = tokenize(query_text)
-    tokens.extend(tokenize(translated_query))
-    tokens.extend(tokenize(" ".join(include_ingredients)))
-    tokens.extend(tokenize(" ".join(translated_ingredients)))
+def _strip_translation_fillers(text):
+    cleaned = normalize(text)
+    for pattern in TRANSLATION_FILLER_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _has_meaningful_tokens(tokens):
+    return any(len(token) >= 3 and token not in STOP_TOKENS for token in tokens)
+
+
+def _is_generic_category_request(original_tokens, translated_tokens, meal_type, include_ingredients):
+    if meal_type or include_ingredients:
+        return None
+
+    meaningful_tokens = {
+        token for token in translated_tokens if len(token) >= 3 and token not in STOP_TOKENS and token not in MEAL_QUERY_TOKENS
+    }
+    original_set = {token for token in original_tokens if len(token) >= 3 and token not in STOP_TOKENS}
+
+    if not meaningful_tokens and not original_set:
+        return None
+
+    for category, config in GENERIC_CATEGORY_HINTS.items():
+        if meaningful_tokens and meaningful_tokens.issubset(set(config["dataset_tokens"])):
+            return category
+        if original_set and original_set.issubset(set(config["native_tokens"])):
+            return category
+    return None
+
+
+def _category_search_tokens(category_key):
+    return list(GENERIC_CATEGORY_HINTS.get(category_key, {}).get("dataset_tokens", []))
+
+
+def _meal_search_tokens(meal_type):
+    hints = MEAL_HINTS.get(meal_type, [])
+    tokens = []
+    for hint in hints:
+        translated = translate_to_en(str(hint))
+        tokens.extend(tokenize(translated))
     unique = []
     for token in tokens:
         if len(token) < 3 or token in STOP_TOKENS:
             continue
         if token not in unique:
             unique.append(token)
+    return unique[:8]
+
+
+def _dataset_query_profile(query_text, include_ingredients=None, meal_type=None):
+    include_ingredients = include_ingredients or []
+    cleaned_query = _strip_translation_fillers(query_text)
+    translated_query = translate_to_en(cleaned_query or query_text)
+    translated_ingredients = [translate_to_en(entry) for entry in include_ingredients]
+    original_tokens = tokenize(cleaned_query or query_text)
+    translated_tokens = tokenize(translated_query)
+    category_key = _is_generic_category_request(
+        original_tokens,
+        translated_tokens,
+        meal_type,
+        include_ingredients,
+    )
+
+    primary_tokens = list(translated_tokens)
+    primary_tokens.extend(tokenize(" ".join(translated_ingredients)))
+    alias_tokens = []
+    for token in original_tokens + primary_tokens:
         for stem, aliases in DATASET_TOKEN_ALIASES.items():
             if token.startswith(stem):
-                for alias in aliases:
-                    if alias not in unique:
-                        unique.append(alias)
-    return unique[:8]
+                alias_tokens.extend(normalize(alias) for alias in aliases)
+    meaningful_primary = [token for token in primary_tokens if len(token) >= 3 and token not in STOP_TOKENS]
+    has_non_meal_tokens = any(token not in MEAL_QUERY_TOKENS for token in meaningful_primary)
+    if has_non_meal_tokens:
+        primary_tokens = [token for token in primary_tokens if token not in MEAL_QUERY_TOKENS]
+
+    fallback_tokens = []
+    if not _has_meaningful_tokens(primary_tokens):
+        original_tokens = tokenize(cleaned_query or query_text)
+        ingredient_tokens = tokenize(" ".join(include_ingredients))
+        fallback_tokens.extend(original_tokens)
+        fallback_tokens.extend(ingredient_tokens)
+        for token in original_tokens + ingredient_tokens:
+            for stem, aliases in DATASET_TOKEN_ALIASES.items():
+                if token.startswith(stem):
+                    fallback_tokens.extend(aliases)
+
+    unique = []
+    for token in primary_tokens + alias_tokens + fallback_tokens:
+        if len(token) < 3 or token in STOP_TOKENS:
+            continue
+        if token not in unique:
+            unique.append(token)
+
+    search_tokens = list(unique[:8])
+    if category_key and not search_tokens:
+        search_tokens = _category_search_tokens(category_key)
+    if meal_type and not search_tokens:
+        search_tokens = _meal_search_tokens(meal_type)
+
+    return {
+        "query_text": str(query_text or ""),
+        "cleaned_query": cleaned_query,
+        "translated_query": translated_query,
+        "query_tokens": list(unique[:8]),
+        "search_tokens": search_tokens,
+        "category_key": category_key,
+        "meal_type": meal_type,
+    }
+
+
+def _dataset_query_tokens(query_text, include_ingredients=None, meal_type=None):
+    return _dataset_query_profile(
+        query_text,
+        include_ingredients=include_ingredients,
+        meal_type=meal_type,
+    )["query_tokens"]
+
+
+@lru_cache(maxsize=1)
+def get_recipenlg_preview(limit=10):
+    dataset_path = recipenlg_csv_path()
+    if dataset_path is None:
+        return []
+
+    preview = []
+    with open(dataset_path, "r", encoding="utf-8", errors="ignore") as file:
+        reader = csv.DictReader(file)
+        for idx, row in enumerate(reader):
+            title = str(row.get("title", "")).strip()
+            ingredients = _parse_list_like(row.get("ingredients", ""))
+            if title:
+                preview.append(
+                    {
+                        "title": title,
+                        "title_ru": translate_to_ru(title),
+                        "ingredient_count": len(ingredients),
+                    }
+                )
+            if idx + 1 >= limit:
+                break
+    return preview
+
+
+def localize_recipenlg_item(item, with_details=False):
+    localized = dict(item or {})
+    localized["title_ru"] = translate_to_ru(localized.get("title", ""))
+    if not with_details:
+        return localized
+
+    ingredients = localized.get("ingredients", [])[:10]
+    directions = localized.get("directions", [])[:3]
+    localized["ingredients_ru_text"] = (
+        translate_to_ru(", ".join(str(entry) for entry in ingredients if str(entry).strip()))
+        if ingredients
+        else "нет данных"
+    )
+    localized["directions_ru_text"] = (
+        translate_to_ru(" ".join(str(entry) for entry in directions if str(entry).strip()))
+        if directions
+        else "нет шагов"
+    )
+    return localized
+
+
+def get_translation_status():
+    return {
+        "ru_translator_ready": _get_ru_translator() is not None,
+        "en_translator_ready": _get_en_translator() is not None,
+        "ru_provider": _TRANSLATION_RUNTIME["ru"]["provider"],
+        "en_provider": _TRANSLATION_RUNTIME["en"]["provider"],
+        "ru_last_error": _TRANSLATION_RUNTIME["ru"]["last_error"],
+        "en_last_error": _TRANSLATION_RUNTIME["en"]["last_error"],
+    }
+
+
+def _compute_dataset_tags(title, ingredients_text, ner_text):
+    text = normalize(" ".join([title, ingredients_text, ner_text]))
+    tags = set()
+    for category, config in GENERIC_CATEGORY_HINTS.items():
+        if any(token in text for token in config["required_tokens"]):
+            tags.add(category)
+    for meal_type, tag in MEAL_TAGS.items():
+        if any(normalize(hint) in text for hint in MEAL_HINTS.get(meal_type, [])):
+            tags.add(tag)
+    return " ".join(sorted(tags))
+
+
+def _index_metadata(path):
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            rows = conn.execute("SELECT key, value FROM meta").fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(key): str(value) for key, value in rows}
+
+
+def _expected_index_metadata(dataset_path):
+    stats = dataset_path.stat()
+    return {
+        "schema_version": RECIPE_NLG_INDEX_SCHEMA_VERSION,
+        "source_path": str(dataset_path.resolve()),
+        "source_size": str(stats.st_size),
+        "source_mtime_ns": str(getattr(stats, "st_mtime_ns", int(stats.st_mtime * 1_000_000_000))),
+    }
+
+
+def get_search_index_status():
+    dataset_path = recipenlg_csv_path()
+    status = {
+        "ready": False,
+        "backend": _SEARCH_INDEX_RUNTIME["backend"],
+        "path": str(RECIPE_NLG_INDEX_PATH),
+        "last_error": _SEARCH_INDEX_RUNTIME["last_error"],
+        "row_count": 0,
+        "built_at": None,
+        "needs_rebuild": False,
+    }
+    if dataset_path is None:
+        status["last_error"] = "RecipeNLG CSV not found"
+        return status
+
+    if not RECIPE_NLG_INDEX_PATH.exists():
+        status["needs_rebuild"] = True
+        return status
+
+    metadata = _index_metadata(RECIPE_NLG_INDEX_PATH)
+    expected = _expected_index_metadata(dataset_path)
+    if not metadata:
+        status["needs_rebuild"] = True
+        status["last_error"] = "search index metadata missing"
+        return status
+
+    status["row_count"] = int(metadata.get("row_count", "0") or "0")
+    status["built_at"] = metadata.get("built_at")
+    status["needs_rebuild"] = any(metadata.get(key) != value for key, value in expected.items())
+    status["ready"] = not status["needs_rebuild"]
+    return status
+
+
+def _open_search_index():
+    conn = sqlite3.connect(str(RECIPE_NLG_INDEX_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_recipenlg_search_index(force_rebuild=False):
+    dataset_path = recipenlg_csv_path()
+    if dataset_path is None:
+        _SEARCH_INDEX_RUNTIME["last_error"] = "RecipeNLG CSV not found"
+        return get_search_index_status()
+
+    current_status = get_search_index_status()
+    if current_status["ready"] and not force_rebuild:
+        return current_status
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = RECIPE_NLG_INDEX_PATH.with_suffix(".tmp.sqlite3")
+    if temp_path.exists():
+        temp_path.unlink()
+    if force_rebuild and RECIPE_NLG_INDEX_PATH.exists():
+        RECIPE_NLG_INDEX_PATH.unlink()
+
+    expected = _expected_index_metadata(dataset_path)
+    started_at = str(int(time.time()))
+    row_count = 0
+    _SEARCH_INDEX_RUNTIME["last_error"] = None
+
+    try:
+        with sqlite3.connect(str(temp_path)) as conn:
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE recipenlg_fts USING fts5(
+                    title,
+                    ingredients_text,
+                    directions_text,
+                    ner_text,
+                    category_tags,
+                    source UNINDEXED,
+                    tokenize='unicode61'
+                )
+                """
+            )
+
+            batch = []
+            with open(dataset_path, "r", encoding="utf-8", errors="ignore") as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    title = str(row.get("title", "")).strip()
+                    ingredients_text = str(row.get("ingredients", "")).strip()
+                    directions_text = str(row.get("directions", "")).strip()
+                    ner_text = str(row.get("NER", "")).strip()
+                    source = str(row.get("source", "")).strip()
+                    if not title:
+                        continue
+
+                    batch.append(
+                        (
+                            title,
+                            ingredients_text,
+                            directions_text,
+                            ner_text,
+                            _compute_dataset_tags(title, ingredients_text, ner_text),
+                            source,
+                        )
+                    )
+                    if len(batch) >= RECIPE_NLG_INDEX_BATCH_SIZE:
+                        conn.executemany(
+                            """
+                            INSERT INTO recipenlg_fts(
+                                title, ingredients_text, directions_text, ner_text, category_tags, source
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            batch,
+                        )
+                        conn.commit()
+                        row_count += len(batch)
+                        batch = []
+
+                if batch:
+                    conn.executemany(
+                        """
+                        INSERT INTO recipenlg_fts(
+                            title, ingredients_text, directions_text, ner_text, category_tags, source
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    conn.commit()
+                    row_count += len(batch)
+
+            metadata_rows = list(expected.items()) + [
+                ("row_count", str(row_count)),
+                ("built_at", started_at),
+            ]
+            conn.executemany("INSERT INTO meta(key, value) VALUES (?, ?)", metadata_rows)
+            conn.execute("INSERT INTO recipenlg_fts(recipenlg_fts) VALUES ('optimize')")
+            conn.commit()
+
+        temp_path.replace(RECIPE_NLG_INDEX_PATH)
+    except (OSError, sqlite3.Error, csv.Error) as exc:
+        _SEARCH_INDEX_RUNTIME["last_error"] = str(exc)
+        if temp_path.exists():
+            temp_path.unlink()
+        return get_search_index_status()
+
+    _SEARCH_INDEX_RUNTIME["last_error"] = None
+    return get_search_index_status()
 
 
 def _dataset_recipe_document(item):
@@ -285,6 +680,21 @@ def _dataset_recipe_document(item):
         " ".join(item.get("directions", [])[:2]),
     ]
     return " ".join(part for part in parts if str(part).strip())
+
+
+def _item_matches_category(item, category_key):
+    config = GENERIC_CATEGORY_HINTS.get(category_key)
+    if not config:
+        return True
+    title_tokens = set(tokenize(item.get("title", "")))
+    document_tokens = set(tokenize(_dataset_recipe_document(item)))
+    required_tokens = set(config.get("required_tokens", set()))
+    if not required_tokens.intersection(document_tokens):
+        return False
+    excluded = set(config.get("exclude_title_tokens", set()))
+    if excluded.intersection(title_tokens):
+        return False
+    return True
 
 
 def _expand_dataset_alias_tokens(values):
@@ -351,103 +761,187 @@ def _dataset_match_reason(item, include_ingredients, meal_type, cosine_score, fu
     return "; ".join(reasons)
 
 
-@lru_cache(maxsize=64)
-def _search_recipenlg_candidates_cached(query_text, include_ingredients_key, limit):
-    if pd is None:
-        return []
+def _title_phrase_score(item, query_text, query_tokens):
+    title_norm = normalize(item.get("title", ""))
+    query_norm = normalize(query_text)
+    if not title_norm or not query_norm:
+        return 0.0
 
-    dataset_path = recipenlg_csv_path()
-    if dataset_path is None:
-        return []
+    score = 0.0
+    if title_norm == query_norm:
+        score += 1.0
+    if query_norm in title_norm:
+        score += 0.8
 
-    include_ingredients = list(include_ingredients_key)
-    query_tokens = _dataset_query_tokens(query_text, include_ingredients)
+    title_tokens = set(tokenize(title_norm))
+    token_set = {token for token in query_tokens if len(token) >= 3}
+    if token_set:
+        overlap = len(token_set & title_tokens) / len(token_set)
+        score += 0.7 * overlap
+        if token_set.issubset(title_tokens):
+            score += 0.5
+
+    if "salad" in token_set and any(token in title_tokens for token in {"dressing", "dip", "sauce"}):
+        score -= 0.6
+
+    return min(score, 1.8)
+
+
+def _dataset_keyword_score(item, query_tokens):
     if not query_tokens:
+        return 0.0
+
+    title_tokens = set(tokenize(item.get("title", "")))
+    ingredient_tokens = _expand_dataset_alias_tokens(item.get("ingredients", []))
+    document_tokens = title_tokens | ingredient_tokens
+    overlap = len(set(query_tokens) & document_tokens)
+    score = overlap / max(len(set(query_tokens)), 1)
+    if "salad" in set(query_tokens) and any(token in title_tokens for token in {"dressing", "dip", "sauce"}):
+        score = max(0.0, score - 0.5)
+    return score
+
+
+def _candidate_search_score(item, query_text, query_tokens):
+    combined_norm = normalize(_dataset_recipe_document(item))
+    token_set = {token for token in query_tokens if len(token) >= 3}
+    overlap = len(token_set & set(tokenize(combined_norm))) / max(len(token_set), 1)
+    return (2.5 * _title_phrase_score(item, query_text, query_tokens)) + overlap
+
+
+@lru_cache(maxsize=64)
+def _search_recipenlg_candidates_cached(query_text, include_ingredients_key, meal_type, limit):
+    profile = _dataset_query_profile(
+        query_text,
+        include_ingredients=list(include_ingredients_key),
+        meal_type=meal_type or None,
+    )
+    query_tokens = profile["query_tokens"]
+    search_tokens = profile["search_tokens"]
+    if not query_tokens and not search_tokens:
         return []
+
+    index_status = ensure_recipenlg_search_index()
+    if not index_status["ready"]:
+        return []
+
+    try:
+        conn = _open_search_index()
+    except sqlite3.Error as exc:
+        _SEARCH_INDEX_RUNTIME["last_error"] = str(exc)
+        return []
+
+    fts_queries = []
+    if profile["category_key"]:
+        category_query = f"category_tags:{profile['category_key']}*"
+        fts_queries.append(category_query)
+    if meal_type and meal_type in MEAL_TAGS:
+        fts_queries.append(f"category_tags:{MEAL_TAGS[meal_type]}*")
+    safe_tokens = [token for token in search_tokens if re.fullmatch(r"[a-z0-9]+", token)]
+    if len(safe_tokens) >= 2:
+        fts_queries.append(" ".join(f"{token}*" for token in safe_tokens[:4]))
+    if safe_tokens:
+        fts_queries.append(" OR ".join(f"{token}*" for token in safe_tokens[:6]))
 
     results = []
     seen_titles = set()
 
     try:
-        reader = pd.read_csv(
-            dataset_path,
-            usecols=["title", "ingredients", "directions", "NER", "source"],
-            chunksize=RECIPE_NLG_CHUNK_SIZE,
-            on_bad_lines="skip",
-        )
-    except Exception:
-        return []
-
-    for chunk_idx, chunk in enumerate(reader):
-        if chunk_idx >= RECIPE_NLG_MAX_SCAN_CHUNKS:
-            break
-
-        title_series = chunk["title"].astype(str)
-        ingredients_series = chunk["ingredients"].astype(str)
-        ner_series = chunk["NER"].astype(str)
-        combined = (
-            title_series.str.lower() + " " + ingredients_series.str.lower() + " " + ner_series.str.lower()
-        )
-
-        mask = False
-        for token in query_tokens:
-            mask = mask | combined.str.contains(re.escape(token), case=False, na=False)
-
-        subset = chunk[mask]
-        if subset.empty:
-            continue
-
-        for _, row in subset.head(40).iterrows():
-            title = str(row.get("title", "")).strip()
-            key = normalize(title)
-            if not key or key in seen_titles:
-                continue
-            seen_titles.add(key)
-            results.append(
-                {
+        for fts_query in dict.fromkeys(query.strip() for query in fts_queries if query.strip()):
+            rows = conn.execute(
+                """
+                SELECT title, ingredients_text, directions_text, ner_text, category_tags, source,
+                       bm25(recipenlg_fts) AS rank
+                FROM recipenlg_fts
+                WHERE recipenlg_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, RECIPE_NLG_SEARCH_POOL),
+            ).fetchall()
+            for row in rows:
+                title = str(row["title"]).strip()
+                key = normalize(title)
+                if not key or key in seen_titles:
+                    continue
+                item = {
                     "title": title,
-                    "ingredients": _parse_list_like(row.get("ingredients", "")),
-                    "directions": _parse_list_like(row.get("directions", "")),
-                    "ner": _parse_list_like(row.get("NER", "")),
-                    "source": str(row.get("source", "")).strip(),
+                    "ingredients": _parse_list_like(row["ingredients_text"]),
+                    "directions": _parse_list_like(row["directions_text"]),
+                    "ner": _parse_list_like(row["ner_text"]),
+                    "source": str(row["source"]).strip(),
+                    "category_tags": tokenize(row["category_tags"]),
+                    "_fts_rank": float(row["rank"]),
                 }
-            )
-            if len(results) >= limit:
-                return results
+                if profile["category_key"] and not _item_matches_category(item, profile["category_key"]):
+                    continue
+                item["_search_score"] = _candidate_search_score(
+                    item,
+                    profile["translated_query"] or profile["query_text"],
+                    query_tokens or search_tokens,
+                )
+                results.append(item)
+                seen_titles.add(key)
+                if len(results) >= RECIPE_NLG_SEARCH_POOL:
+                    break
+            if len(results) >= RECIPE_NLG_SEARCH_POOL:
+                break
+    except sqlite3.Error as exc:
+        _SEARCH_INDEX_RUNTIME["last_error"] = str(exc)
+        return []
+    finally:
+        conn.close()
 
-    return results
+    results.sort(
+        key=lambda item: (item.get("_search_score", 0.0), -item.get("_fts_rank", 0.0), item.get("title", "")),
+        reverse=True,
+    )
+    return results[:limit]
 
 
 def search_recipenlg_candidates(query_text, include_ingredients=None, limit=RECIPE_NLG_MAX_CANDIDATES):
     include_ingredients = include_ingredients or []
     include_key = tuple(sorted(normalize(item) for item in include_ingredients))
-    return _search_recipenlg_candidates_cached(str(query_text or ""), include_key, int(limit))
+    return _search_recipenlg_candidates_cached(str(query_text or ""), include_key, "", int(limit))
 
 
 def rank_recipenlg_candidates(
     query_text,
     include_ingredients=None,
     exclude_ingredients=None,
+    exclude_titles=None,
     meal_type=None,
     limit=8,
 ):
     include_ingredients = include_ingredients or []
     exclude_ingredients = exclude_ingredients or []
-    candidates = search_recipenlg_candidates(query_text, include_ingredients=include_ingredients)
+    exclude_titles = exclude_titles or []
+    candidates = _search_recipenlg_candidates_cached(
+        str(query_text or ""),
+        tuple(sorted(normalize(item) for item in include_ingredients)),
+        meal_type or "",
+        RECIPE_NLG_MAX_CANDIDATES,
+    )
     if not candidates:
         return []
 
-    dataset_query_text = " ".join(_dataset_query_tokens(query_text, include_ingredients))
+    profile = _dataset_query_profile(query_text, include_ingredients=include_ingredients, meal_type=meal_type)
+    query_tokens = profile["query_tokens"] or profile["search_tokens"]
+    dataset_query_text = " ".join(query_tokens)
     query_vector = vectorize_text(dataset_query_text)
     query_normalized = normalize(dataset_query_text)
     exclude_set = _expand_dataset_alias_tokens(exclude_ingredients)
+    excluded_titles_normalized = {normalize(title) for title in exclude_titles}
     ranked = []
 
     for item in candidates:
+        if normalize(item.get("title", "")) in excluded_titles_normalized:
+            continue
         ingredient_set = _expand_dataset_alias_tokens(item.get("ingredients", []))
         if exclude_set and ingredient_set.intersection(exclude_set):
             continue
         if meal_type and not _dataset_recipe_matches_meal(item, meal_type):
+            continue
+        if profile["category_key"] and not _item_matches_category(item, profile["category_key"]):
             continue
 
         document = _dataset_recipe_document(item)
@@ -463,7 +957,17 @@ def rank_recipenlg_candidates(
             exclude_ingredients=exclude_ingredients,
             meal_type=meal_type,
         )
-        total_score = (0.5 * cosine_score) + (0.2 * fuzzy_score) + (0.3 * rule_score)
+        keyword_score = _dataset_keyword_score(item, query_tokens)
+        title_score = _title_phrase_score(item, dataset_query_text, query_tokens)
+        category_score = 1.0 if profile["category_key"] and _item_matches_category(item, profile["category_key"]) else 0.0
+        total_score = (
+            (0.18 * cosine_score)
+            + (0.1 * fuzzy_score)
+            + (0.2 * rule_score)
+            + (0.22 * keyword_score)
+            + (0.2 * title_score)
+            + (0.1 * category_score)
+        )
         ranked.append(
             {
                 "title": item.get("title", ""),
@@ -474,6 +978,9 @@ def rank_recipenlg_candidates(
                 "cosine_similarity": round(cosine_score, 4),
                 "fuzzy_score": round(fuzzy_score, 4),
                 "rule_score": round(rule_score, 4),
+                "keyword_score": round(keyword_score, 4),
+                "title_score": round(title_score, 4),
+                "category_score": round(category_score, 4),
                 "match_reason": _dataset_match_reason(
                     item,
                     include_ingredients,
@@ -488,12 +995,7 @@ def rank_recipenlg_candidates(
         key=lambda item: (item["total_score"], item["cosine_similarity"], item["fuzzy_score"]),
         reverse=True,
     )
-    top_ranked = ranked[:limit]
-    for item in top_ranked:
-        item["title_ru"] = translate_to_ru(item.get("title", ""))
-        item["ingredients_ru"] = [translate_to_ru(entry) for entry in item.get("ingredients", [])[:10]]
-        item["directions_ru"] = [translate_to_ru(entry) for entry in item.get("directions", [])[:3]]
-    return top_ranked
+    return [localize_recipenlg_item(item, with_details=False) for item in ranked[:limit]]
 
 
 def vectorize_text(text):
@@ -520,253 +1022,3 @@ def fuzzy_similarity(left_text, right_text):
     if not left or not right:
         return 0.0
     return SequenceMatcher(None, left, right).ratio()
-
-
-def recipe_matches_meal(recipe_name, meal_type):
-    if not meal_type:
-        return True
-    return meal_type in infer_meal_tags(recipe_name)
-
-
-def filter_recipe_candidates(
-    graph,
-    include_ingredients=None,
-    exclude_ingredients=None,
-    exclude_allergens=None,
-    meal_type=None,
-    min_calories=None,
-    max_calories=None,
-):
-    include_ingredients = include_ingredients or []
-    exclude_ingredients = exclude_ingredients or []
-    exclude_allergens = exclude_allergens or []
-
-    include_set = {normalize(item) for item in include_ingredients}
-    exclude_set = {normalize(item) for item in exclude_ingredients}
-    exclude_allergen_set = {normalize(item) for item in exclude_allergens}
-
-    recipes, _, _ = graph_lists(graph)
-    filtered = []
-
-    for recipe_name in recipes:
-        calories = recipe_calories(graph, recipe_name)
-        if min_calories is not None and calories < min_calories:
-            continue
-        if max_calories is not None and calories > max_calories:
-            continue
-        if meal_type and not recipe_matches_meal(recipe_name, meal_type):
-            continue
-
-        ingredients = {normalize(item) for item in recipe_ingredients(graph, recipe_name)}
-        allergens = {normalize(item) for item in recipe_allergens(graph, recipe_name)}
-
-        if include_set and not include_set.issubset(ingredients):
-            continue
-        if exclude_set and ingredients.intersection(exclude_set):
-            continue
-        if exclude_allergen_set and allergens.intersection(exclude_allergen_set):
-            continue
-
-        filtered.append(recipe_name)
-
-    return filtered
-
-
-def find_recipe_by_name(graph, text):
-    recipes, _, _ = graph_lists(graph)
-    normalized = {normalize(recipe): recipe for recipe in recipes}
-    query = normalize(text)
-    fragments = [query]
-
-    pattern_fragments = [
-        r"похож(?:ие|ий|ая)?\s+(?:блюда\s+)?на\s+(.+)",
-        r"что\s+похоже\s+на\s+(.+)",
-        r"аналог\s+(.+)",
-        r"similar\s+to\s+(.+)",
-    ]
-    for pattern in pattern_fragments:
-        match = re.search(pattern, query)
-        if match:
-            fragments.append(match.group(1).strip())
-
-    for fragment in fragments:
-        if fragment in normalized:
-            return normalized[fragment]
-
-    for fragment in fragments:
-        for normalized_recipe, recipe_name in normalized.items():
-            if normalized_recipe in fragment or fragment in normalized_recipe:
-                return recipe_name
-
-    for fragment in fragments:
-        close = get_close_matches(fragment, list(normalized.keys()), n=1, cutoff=0.55)
-        if close:
-            return normalized[close[0]]
-
-    for fragment in fragments:
-        tokens = [token for token in tokenize(fragment) if len(token) >= 4]
-        for token in tokens:
-            for normalized_recipe, recipe_name in normalized.items():
-                if token in normalized_recipe:
-                    return recipe_name
-    return None
-
-
-def _symbolic_score(graph, recipe_name, include_ingredients, meal_type, target_calories, query_text):
-    signals = []
-    ingredients = {normalize(item) for item in recipe_ingredients(graph, recipe_name)}
-    query_tokens = set(tokenize(query_text))
-
-    if include_ingredients:
-        include_set = {normalize(item) for item in include_ingredients}
-        matched = len(include_set & ingredients)
-        signals.append(matched / max(len(include_set), 1))
-    else:
-        overlap = len(query_tokens & ingredients)
-        signals.append(min(1.0, overlap / 2.0))
-
-    if meal_type:
-        signals.append(1.0 if recipe_matches_meal(recipe_name, meal_type) else 0.0)
-
-    if target_calories is not None:
-        distance = abs(recipe_calories(graph, recipe_name) - target_calories)
-        signals.append(max(0.0, 1.0 - (distance / max(target_calories, 250))))
-
-    return sum(signals) / len(signals) if signals else 0.0
-
-
-def _match_reason(graph, recipe_name, include_ingredients, meal_type, cosine_score, fuzzy_score):
-    reasons = []
-    recipe_ingredient_list = recipe_ingredients(graph, recipe_name)
-    recipe_ingredient_set = {normalize(item) for item in recipe_ingredient_list}
-
-    if include_ingredients:
-        matched = [item for item in include_ingredients if normalize(item) in recipe_ingredient_set]
-        if matched:
-            reasons.append(f"совпали ингредиенты: {', '.join(matched)}")
-
-    if meal_type and recipe_matches_meal(recipe_name, meal_type):
-        reasons.append(f"подходит под прием пищи: {meal_type}")
-
-    if cosine_score >= 0.45:
-        reasons.append("высокая семантическая близость по описанию")
-    if fuzzy_score >= 0.6:
-        reasons.append("похоже по названию/формулировке")
-
-    if not reasons:
-        reasons.append("лучший доступный вариант после фильтрации")
-    return "; ".join(reasons)
-
-
-def rank_recipe_candidates(
-    graph,
-    candidates,
-    query_text,
-    include_ingredients=None,
-    meal_type=None,
-    target_calories=None,
-    limit=8,
-):
-    include_ingredients = include_ingredients or []
-    query_vector = vectorize_text(query_text)
-    query_normalized = normalize(query_text)
-    ranked = []
-
-    for recipe_name in candidates:
-        document = recipe_document(graph, recipe_name)
-        recipe_vector = vectorize_text(document)
-        cosine_score = cosine_similarity(query_vector, recipe_vector)
-        fuzzy_score = max(
-            fuzzy_similarity(query_normalized, recipe_name),
-            fuzzy_similarity(query_normalized, " ".join(recipe_ingredients(graph, recipe_name))),
-        )
-        symbolic_score = _symbolic_score(
-            graph,
-            recipe_name,
-            include_ingredients,
-            meal_type,
-            target_calories,
-            query_text,
-        )
-
-        total_score = (0.5 * cosine_score) + (0.2 * fuzzy_score) + (0.3 * symbolic_score)
-        ranked.append(
-            {
-                "recipe": recipe_name,
-                "total_score": round(total_score, 4),
-                "cosine_similarity": round(cosine_score, 4),
-                "fuzzy_score": round(fuzzy_score, 4),
-                "rule_score": round(symbolic_score, 4),
-                "calories": recipe_calories(graph, recipe_name),
-                "ingredients": recipe_ingredients(graph, recipe_name),
-                "match_reason": _match_reason(
-                    graph,
-                    recipe_name,
-                    include_ingredients,
-                    meal_type,
-                    cosine_score,
-                    fuzzy_score,
-                ),
-            }
-        )
-
-    ranked.sort(
-        key=lambda item: (item["total_score"], item["cosine_similarity"], -item["calories"]),
-        reverse=True,
-    )
-    return ranked[:limit]
-
-
-def rank_similar_recipes(graph, seed_recipe, limit=5):
-    if seed_recipe not in graph:
-        return []
-
-    recipes, _, _ = graph_lists(graph)
-    seed_document = recipe_document(graph, seed_recipe)
-    seed_vector = vectorize_text(seed_document)
-    ranked = []
-
-    for recipe_name in recipes:
-        if recipe_name == seed_recipe:
-            continue
-
-        candidate_document = recipe_document(graph, recipe_name)
-        candidate_vector = vectorize_text(candidate_document)
-        cosine_score = cosine_similarity(seed_vector, candidate_vector)
-        fuzzy_score = fuzzy_similarity(seed_recipe, recipe_name)
-        shared_ingredients = sorted(
-            set(recipe_ingredients(graph, seed_recipe)) & set(recipe_ingredients(graph, recipe_name))
-        )
-        hybrid_score = (0.7 * cosine_score) + (0.2 * fuzzy_score) + (
-            0.1 * min(1.0, len(shared_ingredients) / 3.0)
-        )
-        ranked.append(
-            {
-                "recipe": recipe_name,
-                "total_score": round(hybrid_score, 4),
-                "cosine_similarity": round(cosine_score, 4),
-                "fuzzy_score": round(fuzzy_score, 4),
-                "shared_ingredients": shared_ingredients,
-                "calories": recipe_calories(graph, recipe_name),
-            }
-        )
-
-    ranked.sort(
-        key=lambda item: (item["total_score"], item["cosine_similarity"], -item["calories"]),
-        reverse=True,
-    )
-    return ranked[:limit]
-
-
-def format_ranked_recipe_list(ranked_candidates, limit=8):
-    if not ranked_candidates:
-        return "нет подходящих рецептов"
-
-    shown = ranked_candidates[:limit]
-    rendered = [
-        f"{item['recipe']} ({item['calories']} ккал, score: {item['total_score']})"
-        for item in shown
-    ]
-    if len(ranked_candidates) > limit:
-        rendered.append(f"... и еще {len(ranked_candidates) - limit}")
-    return ", ".join(rendered)

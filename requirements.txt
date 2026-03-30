@@ -10,6 +10,9 @@ pandas==2.3.3
 python-multipart==0.0.20
 pymorphy3==2.0.6
 pymorphy3-dicts-ru==2.4.417150.4580142
+scikit-image==0.26.0
 spacy==3.8.11
 streamlit==1.54.0
+torch==2.10.0
+torchvision==0.25.0
 uvicorn==0.36.0

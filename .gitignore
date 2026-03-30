@@ -3,5 +3,13 @@ data/
 data/*
 !data/raw/
 !data/raw/rules.json
+
+.venv/
 venv/
+artifacts/
+
 __pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.mypy_cache/
