@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Chef hat">
+  <rect width="128" height="128" rx="24" fill="#fff7ec"/>
+  <path d="M40 44c0-12 10-22 22-22 6 0 11 2 15 6 4-7 11-12 20-12 13 0 23 10 23 23 0 6-2 11-6 15 5 4 8 10 8 17 0 12-10 22-22 22H32C20 93 10 83 10 71c0-10 7-19 17-21-1-2-1-4-1-6 0-11 9-20 20-20 5 0 10 2 14 5z" fill="#ffffff" stroke="#d9c4a8" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M34 74h60v24c0 6-5 10-10 10H44c-6 0-10-4-10-10V74z" fill="#e45d33"/>
+  <path d="M34 74h60" stroke="#9f3417" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="52" cy="91" r="4" fill="#fff7ec"/>
+  <circle cx="76" cy="91" r="4" fill="#fff7ec"/>
+</svg>

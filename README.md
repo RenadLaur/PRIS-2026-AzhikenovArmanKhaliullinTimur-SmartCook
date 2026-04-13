@@ -175,7 +175,44 @@ bash scripts/run_qa_checks.sh
 
 - окружение;
 - unit-тесты;
+- cleanup Python cache-мусора (`__pycache__`, `*.pyc`, `*.pyo`);
+- отсутствие cache-артефактов в git index;
 - compile check проекта.
+
+## Week 14-15: Demo Day и итоговая защита
+
+Для итоговой защиты проект переведен в demo-ready формат:
+
+- критерии защиты формализованы в backend-отчете:
+  - архитектура;
+  - чистота кода (Git);
+  - работа UI;
+  - сложность интеллектуальной части;
+- добавлен backend-отчет для демонстрации через API;
+- добавлен формальный AI complexity score с разбивкой по компонентам (rules, NLP, retrieval, CV/OCR, unified pipeline);
+- ускорена работа UI за счет ленивой загрузки тяжелых вкладок и TTL-кеша.
+
+Что появилось:
+
+- `src/app_service.py`:
+  - `get_demo_day_report()`
+  - `get_git_summary()`
+  - `get_architecture_map()`
+  - `get_intelligence_complexity()`
+- `src/api.py`:
+  - `GET /demo/report`
+- `src/main.py`:
+  - рабочие вкладки `Чат`, `Фото блюда`, `Аналитика`, `API/Backend`
+  - ускоренная подгрузка статусов и аналитики
+  - нейтральный UI без лишних декоративных loader-иконок
+
+Примеры demo-сценариев (через чат/API):
+
+- `борщ`
+- `похожие на плов`
+- `подбери ужин с курицей`
+- `/nlp покажи датасеты`
+- CV-сценарий через вкладку `Фото блюда`
 
 ## Week 7: Computer Vision (OCR + классификация изображений)
 

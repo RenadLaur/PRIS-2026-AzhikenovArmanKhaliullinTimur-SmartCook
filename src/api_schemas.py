@@ -21,6 +21,16 @@ class StatusResponse(BaseModel):
     vision: dict[str, Any]
 
 
+class DemoReportResponse(BaseModel):
+    summary: dict[str, Any]
+    criteria: list[dict[str, Any]]
+    architecture: list[dict[str, Any]]
+    git: dict[str, Any]
+    scenarios: list[dict[str, Any]]
+    intelligence: dict[str, Any]
+    demo_flow: str
+
+
 class HealthResponse(BaseModel):
     ok: bool
     service: str

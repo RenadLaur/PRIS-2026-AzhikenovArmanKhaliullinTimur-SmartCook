@@ -1,11 +1,11 @@
 from fastapi import FastAPI, File, UploadFile
 
 try:
-    from .app_service import handle_chat_message, handle_image_message, get_runtime_status
-    from .api_schemas import ChatRequest, ChatResponse, HealthResponse, StatusResponse
+    from .app_service import handle_chat_message, handle_image_message, get_demo_day_report, get_runtime_status
+    from .api_schemas import ChatRequest, ChatResponse, DemoReportResponse, HealthResponse, StatusResponse
 except ImportError:
-    from app_service import handle_chat_message, handle_image_message, get_runtime_status
-    from api_schemas import ChatRequest, ChatResponse, HealthResponse, StatusResponse
+    from app_service import handle_chat_message, handle_image_message, get_demo_day_report, get_runtime_status
+    from api_schemas import ChatRequest, ChatResponse, DemoReportResponse, HealthResponse, StatusResponse
 
 
 def create_app():
@@ -22,6 +22,10 @@ def create_app():
     @app.get("/status", response_model=StatusResponse)
     def status():
         return get_runtime_status()
+
+    @app.get("/demo/report", response_model=DemoReportResponse)
+    def demo_report():
+        return get_demo_day_report()
 
     @app.post("/chat", response_model=ChatResponse)
     def chat(payload: ChatRequest):

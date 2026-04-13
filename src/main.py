@@ -33,7 +33,6 @@ except ImportError:
     )
     CHEF_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "chef-hat.svg"
 
-
 st.set_page_config(page_title="SmartCook Chat", page_icon=str(CHEF_ICON_PATH))
 st.logo(str(CHEF_ICON_PATH))
 st.title("SmartCook")
@@ -42,52 +41,25 @@ st.markdown(
     """
     <style>
     [data-testid="stStatusWidget"] {visibility: hidden !important;}
-    .smartcook-run-indicator {
-        position: fixed;
-        top: 0.65rem;
-        right: 15.2rem;
-        z-index: 999999;
-        display: flex;
-        align-items: center;
-        gap: 0.4rem;
-        color: #c86b00;
-        font-weight: 700;
-        font-size: 0.95rem;
-        pointer-events: none;
-    }
-    .smartcook-run-indicator__icon {
-        display: inline-block;
-        font-size: 1.15rem;
-        animation: smartcookPulse 1.4s ease-in-out infinite;
-        transform-origin: center;
-    }
-    @keyframes smartcookPulse {
-        0% { transform: rotate(0deg) scale(1); opacity: 0.9; }
-        50% { transform: rotate(-10deg) scale(1.08); opacity: 1; }
-        100% { transform: rotate(0deg) scale(1); opacity: 0.9; }
-    }
     </style>
-    <div class="smartcook-run-indicator">
-        <span class="smartcook-run-indicator__icon">🍳</span>
-    </div>
     """,
     unsafe_allow_html=True,
 )
 
 
-@st.cache_resource
-def get_ui_status():
+@st.cache_data(ttl=45, show_spinner=False)
+def get_ui_status(cache_version="runtime-v2"):
+    _ = cache_version
     return get_runtime_status()
 
 
-@st.cache_data
-def get_dashboard_view(cache_version="datasets-v2"):
+@st.cache_data(ttl=600, show_spinner=False)
+def get_dashboard_view(cache_version="datasets-v3"):
     _ = cache_version
     return get_dashboard_data()
 
 
 status = get_ui_status()
-dashboard = get_dashboard_view()
 api_catalog = get_api_catalog()
 sample_queries = get_sample_queries()
 datasets_status = status["datasets"]
@@ -119,14 +91,21 @@ def submit_chat_query(raw_text):
 
     st.session_state.query_history.append(clean_input)
     st.session_state.messages.append({"role": "user", "content": compact_text(clean_input)})
-    result = handle_chat_message(clean_input, context=st.session_state.chat_context)
+    with st.spinner("SmartCook анализирует запрос..."):
+        result = handle_chat_message(clean_input, context=st.session_state.chat_context)
     st.session_state.messages.append(
         {"role": "assistant", "content": compact_text(result["response"])}
     )
+    return result
 
 
 def render_sidebar():
     st.header("Управление")
+    if st.button("Обновить статусы", width="stretch"):
+        get_ui_status.clear()
+        get_dashboard_view.clear()
+        st.rerun()
+
     if st.button("Очистить чат", width="stretch"):
         reset_chat_state()
         st.session_state.messages[0]["content"] = (
@@ -288,6 +267,7 @@ def render_vision_tab():
 
 
 def render_dashboard_tab():
+    dashboard = get_dashboard_view()
     st.subheader("Аналитика датасетов")
     summary = dashboard["summary"]
     dataset_inventory = dashboard.get("dataset_inventory") or get_dataset_inventory()

@@ -3,7 +3,12 @@ import unittest
 from fastapi.testclient import TestClient
 
 from src.api import app
-from src.app_service import get_runtime_status, handle_chat_message, initial_chat_context
+from src.app_service import (
+    get_demo_day_report,
+    get_runtime_status,
+    handle_chat_message,
+    initial_chat_context,
+)
 
 
 class AppServiceTests(unittest.TestCase):
@@ -38,6 +43,17 @@ class AppServiceTests(unittest.TestCase):
         self.assertTrue(second["ok"])
         self.assertEqual(first["query_bucket"], second["query_bucket"])
 
+    def test_demo_day_report_contains_core_sections(self):
+        report = get_demo_day_report()
+        self.assertIn("summary", report)
+        self.assertIn("criteria", report)
+        self.assertIn("architecture", report)
+        self.assertIn("scenarios", report)
+        self.assertIn("intelligence", report)
+        self.assertIn("score", report["intelligence"])
+        self.assertIn("components", report["intelligence"])
+        self.assertTrue(report["criteria"])
+
 
 class ApiSmokeTests(unittest.TestCase):
     @classmethod
@@ -55,6 +71,13 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertTrue(response.json()["ok"])
         self.assertIn("recipe_title", response.json())
         self.assertIn("query_bucket", response.json())
+
+    def test_demo_report_endpoint(self):
+        response = self.client.get("/demo/report")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("summary", payload)
+        self.assertIn("criteria", payload)
 
 
 if __name__ == "__main__":
